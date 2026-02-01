@@ -1,0 +1,9 @@
+image: toitlang/toit:latest
+
+stages:
+  - test
+
+test:
+  stage: test
+  script:
+    - make test

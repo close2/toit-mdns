@@ -1,0 +1,36 @@
+# Zero-Clause BSD License
+# Copyright (C) 2024 Toitware ApS.
+
+name: CI
+
+on:
+  push:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ ubuntu-latest, windows-latest, macos-latest ]
+        toit-version: [ v2.0.0-alpha.180, latest ]
+        include:
+          - toit-version: v2.0.0-alpha.180
+            version-name: old
+          - toit-version: latest
+            version-name: new
+
+    name: CI - ${{ matrix.os }} - ${{ matrix.version-name }}
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: toitlang/action-setup@v1
+        with:
+          toit-version: ${{ matrix.toit-version }}
+
+      - name: Test
+        run: |
+          make test

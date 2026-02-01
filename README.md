@@ -1,0 +1,135 @@
+# mDNS for Toit
+
+A comprehensive mDNS (Multicast DNS) and DNS-SD (DNS Service Discovery) package for Toit.
+It allows ESP32 devices to resolve `.local` hostnames, discover services, and advertise their own services on the local network.
+
+## Features
+
+- **Hostname Resolution**: Resolve `.local` hostnames to IP addresses.
+- **Service Discovery**: Browse for services (e.g., `_http._tcp`) and resolve instances.
+- **Service Registration**: Advertise your own services with PTR, SRV, TXT, and A records.
+- **Caching**: Efficient caching of records to minimize network traffic and latency.
+- **Conflict Resolution**: Handles name conflicts automatically (RFC 6762).
+- **Unicast Responses**: Support for Unicast responses (QU bit) to reduce multicast traffic.
+- **RFC Compliance**: Implements core "MUST" requirements of RFC 6762 and RFC 6763.
+
+## Usage
+
+This package follows a Provider/Client model. The `MdnsServiceProvider` handles the mDNS state machine and networking, while `Client` talks to it.
+
+You can run the Provider in two ways:
+1.  **Shared Service (Recommended)**: Run `MdnsServiceProvider` in its own container. Other containers on the device can then share this single instance via `MdnsClient`.
+2.  **Local Usage**: Run `MdnsServiceProvider` directly in your application container.
+
+### Option 1: Shared Service
+
+**1. Install Provider**
+
+Create a file `mdns-provider.toit`:
+
+```toit
+import mdns.service
+
+main:
+  service := service.MdnsServiceProvider
+  service.install
+```
+
+Install it on your device:
+
+```bash
+jag container install mdns mdns-provider.toit
+```
+
+**2. Use Client**
+
+In your other applications, simply use the client:
+
+```toit
+import mdns
+
+main:
+import mdns.client
+
+main:
+  client := client.Client
+  // client.dns-lookup / client.register-service / client.browse
+```
+
+### Option 2: Local Usage
+
+If you don't want to run a separate container, you can start the service directly in your app.
+
+> [!NOTE]
+> `MdnsServiceProvider` is a `ServiceProvider` and will register itself as the system's mDNS service provider upon instantiation. Be aware of this if you are running multiple instances or want to avoid global service registration.
+
+```toit
+import mdns
+import mdns.client 
+
+main:
+  // Create a client that manages its own local mDNS provider
+  client := LocalMdnsClient
+  
+  // Optional: Set as default mDNS resolver for the SDK
+  // dns.default-mdns-client = client.dns-client
+
+  // Use the client as normal
+  client.register-service "_http._tcp" 8080 
+      --name="MyDevice" 
+      --txt={"path": "/"}
+      
+  // ... when done, close the client to stop the service
+  // client.close
+```
+
+### Publishing Device Name
+
+Each client connection manages its own requested hostname. The service announces a hostname only while at least one client is requesting it (reference counted). 
+
+By default, a client requests `toit-device.local` (or similar system default). You can change this using `set-hostname`.
+
+```toit
+import mdns
+import mdns.client
+
+main:
+  client := client.Client
+  client.set-hostname "my-cool-device.local" 
+  
+  // The service will now probe and announce "my-cool-device.local".
+  // If the client disconnects or the app exits, the hostname is released.
+```
+
+## RFC Compliance
+
+This implementation targets RFC 6762 (mDNS) and RFC 6763 (DNS-SD).
+
+| Feature                      | RFC  | Status        | Notes                                         |
+|:-----------------------------|:-----|:--------------|:----------------------------------------------|
+| **Probing**                  | 6762 | ✅ Implemented | Verifies uniqueness before claiming names.    |
+| **Announcing**               | 6762 | ✅ Implemented | Sends gratuitous responses upon registration. |
+| **Conflict Resolution**      | 6762 | ✅ Implemented | Defends names and renames/resets on conflict. |
+| **Response Generation**      | 6762 | ✅ Implemented | Correct TTLs, AA bit, and Record aggregation. |
+| **Known-Answer Suppression** | 6762 | ❌ Optional    | Not yet implemented.                          |
+| **Unicast Responses**        | 6762 | ✅ Implemented | Fully supported (QU bit handling).            |
+| **Truncated Packets (TC)**   | 6762 | ❌ Optional    | UDP only implementation.                      |
+| **Service Registration**     | 6763 | ✅ Implemented | Registers PTR, SRV, TXT, A records.           |
+| **Service Enumeration**      | 6763 | ✅ Implemented | Browsing via generic PTR queries.             |
+| **Service Resolution**       | 6763 | ✅ Implemented | resolving Service Instance Names.             |
+| **TXT Record Strings**       | 6763 | ✅ Implemented | Supports multiple key-value pairs (RFC 1035). |
+| **Subtypes**                 | 6763 | ❌ Optional    | Browsing by subtype not supported yet.        |
+
+## Why use `Client`?
+
+The `Client` provided by this package is the recommended way to interact with mDNS on Toit.
+
+While Toit's `net` library can resolve `.local` names it only implements one-shot queries.
+
+The Client can also be set as default dns client for `.local` requests, rather than relying on one-shot queries.
+```toit
+client := mdns.Client
+dns.default-mdns-client = client.dns-client
+```
+
+The background `MdnsServiceProvider` continuously listens to the multicast group. It maintains a cache of the network state, meaning lookups can often be answered instantly without waiting for a network query.

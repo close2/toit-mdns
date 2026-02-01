@@ -1,0 +1,7 @@
+.packages
+.build
+build
+.toit
+*.snapshot
+.idea
+.vscode
