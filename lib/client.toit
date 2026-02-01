@@ -224,16 +224,6 @@ class DnsClient implements dns.DnsClient:
 
   // dns-lookup-multi style (List of results).
   get name/string -> List
-      --record-type/int
-      --network/udp.Interface
-      --timeout/Duration=dns.DNS-DEFAULT-TIMEOUT:
-    return client_.dns-lookup name
-        --record-types={record-type}
-        --network=network
-        --timeout=timeout
-
-  // Internal helper required by dns.DnsClient interface
-  get_ name/string -> List
       --record-types/Set
       --network/udp.Interface
       --timeout/Duration=dns.DNS-DEFAULT-TIMEOUT:
