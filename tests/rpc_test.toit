@@ -2,9 +2,9 @@ import expect show *
 import net
 import net.modules.dns
 
-import ..src.service
-import ..lib.client
-import ..src.api.mdns_service
+import mdns.service show MdnsServiceProvider
+import mdns.client show Client MdnsServiceClient
+import mdns.api.mdns_service show MdnsService
 
 main:
   // 1. Install Service

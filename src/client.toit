@@ -35,8 +35,8 @@ import net.modules.dns
 import system
 import system.services show ServiceClient
 
-import ..src.api.mdns_service
-import ..src.service as service
+import .api.mdns_service
+import .service as service
 
 /**
 Primary user-facing mDNS client.
@@ -273,7 +273,7 @@ class MdnsServiceClient extends ServiceClient implements MdnsService:
     return invoke_ MdnsService.GET-HOSTNAME-INDEX null
 
   close:
-    // Do nothing for RPC client
+    super
 
 /**
 A client that uses a local mDNS service provider.

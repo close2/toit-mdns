@@ -2,9 +2,9 @@ import expect show *
 import net
 import net.udp
 
-import ..src.server.state_manager
-import ..src.server.conflict_manager
-import ..src.net.mdns_socket
+import mdns.server.state_manager show StateManager
+import mdns.server.conflict_manager show ConflictManager
+import mdns.net.mdns_socket show MdnsSocket
 import .e2e_param show TEST-PORT
 
 main:
@@ -17,7 +17,7 @@ test-closed-socket-race:
   conflict-manager := ConflictManager
   local-ip := net.IpAddress.parse "127.0.0.1"
   
-  state-manager := StateManager socket conflict-manager "test.local" local-ip
+  state-manager := StateManager socket conflict-manager "test.local" local-ip --expected-port=TEST-PORT
   
   // Start the state manager, which enters the probing phase.
   state-manager.start

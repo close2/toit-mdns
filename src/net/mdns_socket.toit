@@ -16,7 +16,6 @@ These follow RFC 6762 requirements for mDNS:
 
 import net
 import net.udp
-import net.modules.udp as udp_impl
 import net.modules.dns
 
 
@@ -40,7 +39,13 @@ class MdnsSocket:
       --group/net.IpAddress=MDNS-MULTICAST-ADDRESS
       --port/int=MDNS-PORT:
     mdns-target_ = net.SocketAddress group port
-    socket_ = udp_impl.Socket.multicast network group port --reuse-address --reuse-port --loopback // We want to hear our own packets for testing/verification usually.
+    // Use network.udp-open-multicast so the socket is created through the
+    // system service proxy on ESP32.  Directly constructing udp_impl.Socket
+    // bypasses the proxy and the sends silently fail on ESP32.
+    socket_ = network.udp-open-multicast group port
+        --reuse-address
+        --reuse-port
+        --loopback
 
   send packet/ByteArray remote/net.SocketAddress=mdns-target_:
     socket_.send (udp.Datagram packet remote)

@@ -2,11 +2,11 @@ import expect show *
 import net
 import net.udp
 import net.modules.dns 
-import ..src.net.dns_helper as dns
+import mdns.net.dns_helper as dns
 
-import ..src.net.mdns_socket
-import ..src.server.conflict_manager
-import ..src.server.state_manager
+import mdns.net.mdns_socket show MdnsSocket
+import mdns.server.conflict_manager show ConflictManager
+import mdns.server.state_manager show StateManager
 import .e2e_param show TEST-PORT
 
  
@@ -23,12 +23,13 @@ test-defense-in-established:
   hostname := "defend-me.local"
   local-ip := net.IpAddress.parse "127.0.0.1"
   
-  state-manager := StateManager socket conflict-manager hostname local-ip
+  state-manager := StateManager socket conflict-manager hostname local-ip --expected-port=TEST-PORT
   
   state-manager.start
   
-  // Probing is automatic via task. Wait for it to complete. 
-  sleep (Duration --ms=800)
+  // Probing is automatic via task. Wait for it to complete.
+  // Jitter (0-250ms) + 3 probes × 250ms + 2 announcements 1s apart = ~2.5s.
+  sleep (Duration --ms=3000)
   
   expect-equals StateManager.STATE-ESTABLISHED state-manager.state_
   print "State should be ESTABLISHED now."

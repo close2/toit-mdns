@@ -3,10 +3,10 @@ import net
 import net.udp
 import net.modules.dns
 
-import ..src.service
-import ..lib.client as client-lib
-import ..src.api.mdns_service
-import ..src.net.mdns_socket
+import mdns.service show MdnsServiceProvider
+import mdns.client as client-lib
+import mdns.api.mdns_service show MdnsService
+import mdns.net.mdns_socket show MdnsSocket
 import .e2e_param show TEST-PORT
 
 main:

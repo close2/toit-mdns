@@ -2,8 +2,8 @@ import expect show *
 import net
 import net.udp
 import net.modules.dns
-import ..lib.client as client-lib
-import ..src.service as service-impl
+import mdns.client as client-lib
+import mdns.service as service-impl
 
 main:
   test-api-structure

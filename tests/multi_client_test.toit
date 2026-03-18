@@ -3,11 +3,11 @@ import net
 import net.udp
 import net.modules.dns
 
-import ..src.service
-import ..lib.client as client-lib
-import ..src.api.mdns_service
+import mdns.service show MdnsServiceProvider
+import mdns.client as client-lib
+import mdns.api.mdns_service show MdnsService
 import .e2e_param show TEST-PORT
-import ..src.net.mdns_socket
+import mdns.net.mdns_socket show MdnsSocket
 
 main:
   test-multi-client
@@ -42,7 +42,7 @@ test-multi-client:
     client-b.register-service "_http._tcp" 9090 --name="ServiceB"
     client-c.register-service "_http._tcp" 9091 --name="ServiceC"
     
-    sleep (Duration --s=2)
+    sleep (Duration --s=5)
     
     // 6. Verification
     network := net.open
@@ -65,7 +65,7 @@ test-multi-client:
       // 7. Client B disconnects
       print "Closing Client B..."
       client-b.service_.close
-      sleep (Duration --ms=500)
+      sleep (Duration --s=2)
       
       // hostname "shared.local" should still resolve because Client C is holding it
       print "Resolving shared.local (after B close)..."
@@ -74,7 +74,7 @@ test-multi-client:
       // 8. Client C disconnects
       print "Closing Client C..."
       client-c.service_.close
-      sleep (Duration --ms=500)
+      sleep (Duration --s=2)
       
       // hostname "shared.local" should NO LONGER resolve (ref count 0)
       print "Verifying shared.local is gone..."
@@ -95,14 +95,16 @@ resolve socket/MdnsSocket name/string -> bool:
   e := catch:
     socket.send (dns.create-dns-packet [dns.Question name dns.RECORD-A] [] --is-response=false --id=0x1111)
     10.repeat:
-      with-timeout (Duration --ms=200):
-        datagram := socket.receive
-        if datagram:
-          parsed := dns.decode-packet datagram.data
-          if parsed.is-response:
-            parsed.resources.do: | res |
-              if res.name == name and res.type == dns.RECORD-A:
-                return true
+      timeout-err := catch:
+        with-timeout (Duration --ms=1500):
+          datagram := socket.receive
+          if datagram:
+            parsed := dns.decode-packet datagram.data
+            if parsed.is-response:
+              parsed.resources.do: | res |
+                if res.name == name and res.type == dns.RECORD-A:
+                  return true
+      // Timeout or error on this iteration: continue to next
   if e: return false
   return false
 

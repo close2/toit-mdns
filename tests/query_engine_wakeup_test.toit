@@ -4,9 +4,9 @@ import net
 import net.udp
 import net.modules.dns
 import io
-import ..src.server.query_engine
-import ..src.server.cache
-import ..src.net.mdns_socket
+import mdns.server.query_engine show QueryEngine
+import mdns.server.cache show MdnsCache
+import mdns.net.mdns_socket show MdnsSocket
 
 TEST-PORT ::= 5354
 TEST-GROUP ::= net.IpAddress.parse "224.0.0.251"

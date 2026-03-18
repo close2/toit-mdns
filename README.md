@@ -46,13 +46,10 @@ jag container install mdns mdns-provider.toit
 In your other applications, simply use the client:
 
 ```toit
-import mdns
+import mdns.client show Client
 
 main:
-import mdns.client
-
-main:
-  client := client.Client
+  client := Client
   // client.dns-lookup / client.register-service / client.browse
 ```
 
@@ -64,8 +61,7 @@ If you don't want to run a separate container, you can start the service directl
 > `MdnsServiceProvider` is a `ServiceProvider` and will register itself as the system's mDNS service provider upon instantiation. Be aware of this if you are running multiple instances or want to avoid global service registration.
 
 ```toit
-import mdns
-import mdns.client 
+import mdns.client show Client LocalMdnsClient
 
 main:
   // Create a client that manages its own local mDNS provider
@@ -90,11 +86,10 @@ Each client connection manages its own requested hostname. The service announces
 By default, a client requests `toit-device.local` (or similar system default). You can change this using `set-hostname`.
 
 ```toit
-import mdns
-import mdns.client
+import mdns.client show Client
 
 main:
-  client := client.Client
+  client := Client
   client.set-hostname "my-cool-device.local" 
   
   // The service will now probe and announce "my-cool-device.local".
@@ -105,20 +100,25 @@ main:
 
 This implementation targets RFC 6762 (mDNS) and RFC 6763 (DNS-SD).
 
-| Feature                      | RFC  | Status        | Notes                                         |
-|:-----------------------------|:-----|:--------------|:----------------------------------------------|
-| **Probing**                  | 6762 | ✅ Implemented | Verifies uniqueness before claiming names.    |
-| **Announcing**               | 6762 | ✅ Implemented | Sends gratuitous responses upon registration. |
-| **Conflict Resolution**      | 6762 | ✅ Implemented | Defends names and renames/resets on conflict. |
-| **Response Generation**      | 6762 | ✅ Implemented | Correct TTLs, AA bit, and Record aggregation. |
-| **Known-Answer Suppression** | 6762 | ❌ Optional    | Not yet implemented.                          |
-| **Unicast Responses**        | 6762 | ✅ Implemented | Fully supported (QU bit handling).            |
-| **Truncated Packets (TC)**   | 6762 | ❌ Optional    | UDP only implementation.                      |
-| **Service Registration**     | 6763 | ✅ Implemented | Registers PTR, SRV, TXT, A records.           |
-| **Service Enumeration**      | 6763 | ✅ Implemented | Browsing via generic PTR queries.             |
-| **Service Resolution**       | 6763 | ✅ Implemented | resolving Service Instance Names.             |
-| **TXT Record Strings**       | 6763 | ✅ Implemented | Supports multiple key-value pairs (RFC 1035). |
-| **Subtypes**                 | 6763 | ❌ Optional    | Browsing by subtype not supported yet.        |
+| Feature                      | RFC  | Status        | Notes                                              |
+|:-----------------------------|:-----|:--------------|:---------------------------------------------------|
+| **Probing**                  | 6762 | ✅ Implemented | 3 probes, 250ms apart, random jitter, tiebreaking. |
+| **Announcing**               | 6762 | ✅ Implemented | 2 unsolicited responses, 1s apart (§8.3).          |
+| **Conflict Resolution**      | 6762 | ✅ Implemented | Defends, renames, 15-conflict rate limiting.       |
+| **Response Generation**      | 6762 | ✅ Implemented | Correct TTLs, AA bit, record aggregation.          |
+| **Known-Answer Suppression** | 6762 | ✅ Implemented | Suppresses when TTL ≥ 50% (§7.1).                  |
+| **Unicast Responses**        | 6762 | ✅ Implemented | QU bit handling.                                   |
+| **Message Validation**       | 6762 | ✅ Implemented | Rejects non-zero OPCODE/RCODE (§18).               |
+| **Source Port Check**        | 6762 | ✅ Implemented | Rejects responses not from port 5353 (§6.10).      |
+| **Response Rate Limiting**   | 6762 | ✅ Implemented | Max 1 multicast/second (§6.16).                    |
+| **Probe Tiebreaking**        | 6762 | ✅ Implemented | Authority Section comparison (§8.2).               |
+| **NSEC Negative Responses**  | 6762 | ❌ Not impl.   | Unique-name NSEC records not yet generated.        |
+| **Truncated Packets (TC)**   | 6762 | ❌ Not impl.   | Multi-packet Known-Answer not supported.           |
+| **Service Registration**     | 6763 | ✅ Implemented | PTR, SRV, TXT, A records.                          |
+| **Service Enumeration**      | 6763 | ✅ Implemented | Browsing via generic PTR queries.                  |
+| **Service Resolution**       | 6763 | ✅ Implemented | Resolving Service Instance Names.                  |
+| **TXT Record Strings**       | 6763 | ✅ Implemented | Multiple key-value pairs (RFC 1035).               |
+| **Subtypes**                 | 6763 | ❌ Not impl.   | Browsing by subtype not supported.                 |
 
 ## Why use `Client`?
 
@@ -128,7 +128,9 @@ While Toit's `net` library can resolve `.local` names it only implements one-sho
 
 The Client can also be set as default dns client for `.local` requests, rather than relying on one-shot queries.
 ```toit
-client := mdns.Client
+import mdns.client show Client
+
+client := Client
 dns.default-mdns-client = client.dns-client
 ```
 

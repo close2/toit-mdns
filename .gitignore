@@ -1,6 +1,5 @@
-.packages
-.build
-build
+.packages/
+/build/
 .toit
 *.snapshot
 .idea
