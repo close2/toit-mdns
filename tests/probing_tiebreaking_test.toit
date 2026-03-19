@@ -63,7 +63,7 @@ test-authoritative-response-conflict:
   packet := dns.create-dns-packet [] answers --id=0 --is-response=true --is-authoritative=true
   sm.process-packet packet
 
-  expect-equals "tiebreak (2).local" sm.hostname
+  expect-equals "tiebreak-2.local" sm.hostname
   sm.stop
   socket.close
   print "  PASS"

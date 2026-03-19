@@ -364,7 +364,7 @@ test-section-9-2-conflict-rename:
   sm.process-packet packet --source=source
 
   sleep (Duration --ms=100)
-  expect-equals "rename (2).local" sm.hostname
+  expect-equals "rename-2.local" sm.hostname
   sm.stop
   socket.close
   print "  PASS"

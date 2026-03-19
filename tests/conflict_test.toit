@@ -10,6 +10,7 @@ import mdns.server.state_manager show StateManager
 
 main:
   test-conflict-resolution
+  test-conflict-resolution-with-hyphenated-hostname
 
 test-conflict-resolution:
   print "Testing conflict resolution..."
@@ -26,7 +27,7 @@ test-conflict-resolution:
   state-manager.start
   
   // Simulate an incoming authoritative response for "test.local" (Conflict!)
-  // This should trigger a rename to "test (2).local"
+  // This should trigger a rename to "test-2.local"
   
   // Wait for probing to have started (jitter 0-250ms + first probe).
   sleep (Duration --ms=300)
@@ -42,7 +43,7 @@ test-conflict-resolution:
   
   // Check if renamed
   // We need to wait a moment for the rename logic (it's synchronous but lets be safe)
-  expect-equals "test (2).local" state-manager.hostname
+  expect-equals "test-2.local" state-manager.hostname
   final-hostname := state-manager.hostname
   print "Conflict resolution: OK (Renamed to $final-hostname)"
   
@@ -51,16 +52,42 @@ test-conflict-resolution:
   print "Waiting for establishment..."
   sleep (Duration --ms=3000)
   
-  // Now it should be established with "test (2).local"
+  // Now it should be established with "test-2.local"
   // Setup: Two providers on the SAME PORT (simulating same network)
   // MdnsSocket uses SO_REUSEPORT, so this is allowed.
   port := TEST-PORT
   
   // 1. Start Server A (First claimer)
-  // We can verify this by checking if it responds to queries for "test (2).local"
+  // We can verify this by checking if it responds to queries for "test-2.local"
   
   // NOTE: In a real test we would capture the output or mock the socket sending.
   // For now, checking the internal hostname is a good proxy.
-  expect-equals "test (2).local" state-manager.hostname
+  expect-equals "test-2.local" state-manager.hostname
   
+  socket.close
+
+test-conflict-resolution-with-hyphenated-hostname:
+  print "Testing conflict resolution with hyphenated hostname..."
+  network := net.open
+
+  socket := MdnsSocket --network=network
+  conflict-manager := ConflictManager
+  hostname := "rc-test.local"
+  local-ip := net.IpAddress.parse "127.0.0.1"
+
+  state-manager := StateManager socket conflict-manager hostname local-ip --expected-port=TEST-PORT
+
+  state-manager.start
+  sleep (Duration --ms=300)
+
+  fake-ip := net.IpAddress.parse "1.1.1.2"
+  answers := [dns.AResource hostname 120 fake-ip --flush=true]
+  packet := dns.create-dns-packet [] answers --id=0 --is-response=true --is-authoritative=true
+
+  state-manager.process-packet packet
+
+  expect-equals "rc-test-2.local" state-manager.hostname
+  print "Conflict resolution with hyphenated hostname: OK ($(state-manager.hostname))"
+
+  state-manager.stop
   socket.close

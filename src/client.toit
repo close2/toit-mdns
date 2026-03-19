@@ -157,7 +157,7 @@ class Client:
   lifecycle based on whether any connected clients are requesting it.
   
   If the hostname is already in use by another device, the service will
-  automatically rename it (e.g., "name.local" -> "name (2).local") and
+  automatically rename it (e.g., "name.local" -> "name-2.local") and
   the effective hostname can be retrieved via $hostname.
   */
   set-hostname hostname/string:
