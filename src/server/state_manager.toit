@@ -379,7 +379,7 @@ class StateManager:
     if q-host:
       // RFC 6762 §7.1: Suppress if already in Known-Answer Section
       // with TTL ≥ 50% of our real TTL.
-      if not query or not dns.has-known-answer query hostname_ 120:
+      if not query or not dns.has-known-answer query hostname_ dns.RECORD-A 120:
         target := q-host.unicast-ok ? unicast-answers : multicast-answers
         target.add (dns.AResource hostname_ 120 local-ip_)
     else if not query:
@@ -394,8 +394,8 @@ class StateManager:
 
       if q-ptr or q-all:
         // Known-Answer Suppression for PTR
-        if query and dns.has-known-answer query s.type-domain 4500:
-          continue.do  // Suppress this service completely
+        if query and dns.has-known-answer query s.type-domain dns.RECORD-PTR 4500 --data=s.full-name:
+          continue.do  // Suppress this specific instance
 
         ptr-unicast := q-ptr ? q-ptr.unicast-ok : false
         all-unicast := q-all ? q-all.unicast-ok : false
