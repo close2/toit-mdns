@@ -430,11 +430,12 @@ class StateManager:
     // Send Multicast
     if not multicast-answers.is-empty:
       // RFC 6762 §6.16: Rate limit multicast responses to 1/s/record.
+      // Skip rather than sleep to avoid blocking the receive loop.
       now := Time.monotonic-us
       elapsed-us := now - last-multicast-time_
       if last-multicast-time_ != 0 and elapsed-us < 1_000_000:
-        sleep (Duration --us=(1_000_000 - elapsed-us))
-      last-multicast-time_ = Time.monotonic-us
+        return
+      last-multicast-time_ = now
 
       // For Multicast, ID must be 0 (RFC 6762 §18.1)
       packet := dns.create-dns-packet [] multicast-answers --id=0 --is-response --is-authoritative
