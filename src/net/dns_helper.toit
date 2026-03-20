@@ -53,13 +53,24 @@ RFC 6762 §7.1: "A Multicast DNS responder MUST NOT answer a Multicast
   DNS query if the answer it would give is already included in the
   Answer Section with an RR TTL at least half the correct value."
 
+The $type parameter specifies the record type to match (e.g.
+  $dns.RECORD-A, $dns.RECORD-PTR).
+The optional $data parameter, when provided, additionally matches
+  against the string value of PTR/CNAME records to avoid suppressing
+  responses for a different service instance sharing the same
+  type-domain.
+
 Returns true if the query's Known-Answer Section already contains
   a matching record with ≥ 50% of our TTL, meaning we should suppress.
 */
-has-known-answer query/dns.DecodedPacket name/string our-ttl/int -> bool:
+has-known-answer query/dns.DecodedPacket name/string type/int our-ttl/int --data/string?=null -> bool:
   query.resources.do: | res |
-    if res.name == name and res.ttl >= (our-ttl / 2):
-      return true
+    if res.name == name and res.type == type and res.ttl >= (our-ttl / 2):
+      if data == null: return true
+      // For PTR/CNAME records, also verify the string data matches
+      // our specific instance.
+      if (res is dns.StringResource) and (res as dns.StringResource).value == data:
+        return true
   return false
 
 /**

@@ -293,18 +293,24 @@ test-section-7-1-known-answer-suppression:
   known-answers := [dns.AResource hostname 80 (net.IpAddress.parse "192.168.1.50")]
   packet := dns.create-dns-packet questions known-answers --id=0 --is-response=false
   decoded := dns-helper.parse packet
-  expect (dns-helper.has-known-answer decoded hostname our-ttl)
+  expect (dns-helper.has-known-answer decoded hostname dns.RECORD-A our-ttl)
 
   // Query with Known-Answer TTL < 50% → must NOT suppress.
   known-answers-low := [dns.AResource hostname 40 (net.IpAddress.parse "192.168.1.50")]
   packet2 := dns.create-dns-packet questions known-answers-low --id=0 --is-response=false
   decoded2 := dns-helper.parse packet2
-  expect (not (dns-helper.has-known-answer decoded2 hostname our-ttl))
+  expect (not (dns-helper.has-known-answer decoded2 hostname dns.RECORD-A our-ttl))
 
   // Query with no Known-Answers → must NOT suppress.
   packet3 := dns.create-dns-packet questions [] --id=0 --is-response=false
   decoded3 := dns-helper.parse packet3
-  expect (not (dns-helper.has-known-answer decoded3 hostname our-ttl))
+  expect (not (dns-helper.has-known-answer decoded3 hostname dns.RECORD-A our-ttl))
+
+  // Wrong record type → must NOT suppress (e.g. PTR answer for an A query).
+  wrong-type-answers := [dns.StringResource hostname dns.RECORD-PTR 80 false "other.local"]
+  packet4 := dns.create-dns-packet questions wrong-type-answers --id=0 --is-response=false
+  decoded4 := dns-helper.parse packet4
+  expect (not (dns-helper.has-known-answer decoded4 hostname dns.RECORD-A our-ttl))
 
   print "  PASS"
 
