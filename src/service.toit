@@ -200,10 +200,17 @@ class MdnsServiceProvider extends services.ServiceProvider
           
           packet-bytes := datagram.data
           
-          // Broadcast to all state managers.
-          // Catch parse errors per-packet so a single malformed packet
-          // (e.g. from non-mDNS multicast traffic) doesn't kill the loop.
+          // Parse once to validate the packet. Malformed packets from
+          // non-mDNS multicast traffic are silently skipped.
+          decoded/dns.DecodedPacket? := null
           parse-exception := catch:
+            decoded = dns.parse packet-bytes
+          if parse-exception:
+            log.debug "mDNS ignoring malformed packet" --tags={"error": parse-exception}
+            continue
+
+          // Broadcast to all state managers.
+          process-exception := catch:
             managers_.do: | name manager/StateManager |
               manager.process-packet packet-bytes --source=datagram.address
             
@@ -211,11 +218,10 @@ class MdnsServiceProvider extends services.ServiceProvider
             // RFC 6762 §7.3: "A Multicast DNS querier MUST NOT cache
             //  resource records observed in the Known-Answer Section of
             //  other Multicast DNS queries." — Only cache from responses.
-            decoded := dns.parse packet-bytes
             if decoded.is-response:
               query-engine_.process-packet decoded
-          if parse-exception:
-            log.debug "mDNS ignoring malformed packet" --tags={"error": parse-exception}
+          if process-exception:
+            log.warn "mDNS packet processing error" --tags={"error": process-exception}
             continue
         if exception:
           if not closed_: log.error "mDNS receive error" --tags={"error": exception}
