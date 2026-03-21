@@ -41,7 +41,7 @@ test-defense-in-established:
   fake-ip := net.IpAddress.parse "6.6.6.6"
   packet := dns.create-dns-packet [] [dns.AResource hostname 120 fake-ip --flush] --id=0 --is-response --is-authoritative
   
-  state-manager.process-packet packet
+  state-manager.process-packet (dns.parse packet)
   
   // Verify DEFENSE
   expect-equals hostname state-manager.hostname

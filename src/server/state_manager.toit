@@ -168,11 +168,9 @@ class StateManager:
   /**
   Processes an incoming mDNS packet.
   Called from the service for every packet.
-  Parses the packet and triggers conflict detection/defense or query responses.
+  Triggers conflict detection/defense or query responses.
   */
-  process-packet packet/ByteArray --source/net.SocketAddress?=null:
-    decoded := dns.parse packet
-
+  process-packet decoded/dns.DecodedPacket --source/net.SocketAddress?=null:
     // RFC 6762 §18.3, §18.11: Reject non-zero OPCODE or RCODE.
     if not dns.is-valid-mdns-message decoded: return
 

@@ -124,8 +124,9 @@ Per RFC 6762 Section 8.2, bytes are compared as unsigned 8-bit values.
 compare-addresses a/net.IpAddress b/net.IpAddress -> int:
   a-bytes := a.raw
   b-bytes := b.raw
-  // Compare type first (IPv4 = class A = type 1; IPv6 = AAAA = type 28).
-  // Same type => compare raw bytes.
+  // Compare raw bytes pairwise as unsigned values, then by length.
+  // When one address is IPv4 (4 bytes) and the other is IPv6 (16 bytes),
+  // the shorter one is considered "earlier" after the shared prefix.
   min-len := min a-bytes.size b-bytes.size
   for i := 0; i < min-len; i++:
     diff := a-bytes[i] - b-bytes[i]

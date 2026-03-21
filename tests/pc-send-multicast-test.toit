@@ -54,7 +54,12 @@ loopback-test network/net.Client:
         --reuse-port
         --loopback
     ready.send socket.local-address.port
-    datagram := socket.receive
+    datagram/udp.Datagram? := null
+    with-timeout (Duration --s=5):
+      datagram = socket.receive
+    if not datagram:
+      socket.close
+      throw "Loopback receive timed out"
     expect-equals "loopback-ping" datagram.data.to-string
     print "  Loopback received OK from $(datagram.address)"
     socket.close

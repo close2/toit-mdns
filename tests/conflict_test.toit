@@ -39,7 +39,7 @@ test-conflict-resolution:
   packet := dns.create-dns-packet questions answers --id=0 --is-response=true --is-authoritative=true
   
   // Inject packet into state machine
-  state-manager.process-packet packet
+  state-manager.process-packet (dns.decode-packet packet --error-name="test")
   
   // Check if renamed
   // We need to wait a moment for the rename logic (it's synchronous but lets be safe)
@@ -84,7 +84,7 @@ test-conflict-resolution-with-hyphenated-hostname:
   answers := [dns.AResource hostname 120 fake-ip --flush=true]
   packet := dns.create-dns-packet [] answers --id=0 --is-response=true --is-authoritative=true
 
-  state-manager.process-packet packet
+  state-manager.process-packet (dns.decode-packet packet --error-name="test")
 
   expect-equals "rc-test-2.local" state-manager.hostname
   print "Conflict resolution with hyphenated hostname: OK ($(state-manager.hostname))"

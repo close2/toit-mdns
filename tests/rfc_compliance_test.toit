@@ -147,7 +147,7 @@ test-section-6-10-reject-response-from-wrong-port:
   answers := [dns.AResource "portcheck.local" 120 other-ip --flush=true]
   packet := dns.create-dns-packet [] answers --id=0 --is-response=true --is-authoritative=true
   wrong-port-source := net.SocketAddress other-ip 1234
-  sm.process-packet packet --source=wrong-port-source
+  sm.process-packet (dns-helper.parse packet) --source=wrong-port-source
 
   // Should be ignored — hostname unchanged.
   expect-equals "portcheck.local" sm.hostname
@@ -265,7 +265,7 @@ test-section-8-5-ignore-responses-before-first-probe:
   answers := [dns.AResource "preprobe.local" 120 other-ip --flush=true]
   packet := dns.create-dns-packet [] answers --id=0 --is-response=true --is-authoritative=true
   source := net.SocketAddress other-ip 5353
-  sm.process-packet packet --source=source
+  sm.process-packet (dns-helper.parse packet) --source=source
 
   // Should be ignored — hostname unchanged.
   expect-equals "preprobe.local" sm.hostname
@@ -339,7 +339,7 @@ test-section-9-1-conflict-resets-to-probing:
   4.repeat:
     answers := [dns.AResource sm.hostname 120 other-ip --flush=true]
     packet := dns.create-dns-packet [] answers --id=0 --is-response=true --is-authoritative=true
-    sm.process-packet packet --source=source
+    sm.process-packet (dns-helper.parse packet) --source=source
     sleep (Duration --ms=50)
 
   // Should have renamed and be back to probing.
@@ -367,7 +367,7 @@ test-section-9-2-conflict-rename:
   answers := [dns.AResource "rename.local" 120 other-ip --flush=true]
   packet := dns.create-dns-packet [] answers --id=0 --is-response=true --is-authoritative=true
   source := net.SocketAddress other-ip TEST-PORT
-  sm.process-packet packet --source=source
+  sm.process-packet (dns-helper.parse packet) --source=source
 
   sleep (Duration --ms=100)
   expect-equals "rename-2.local" sm.hostname

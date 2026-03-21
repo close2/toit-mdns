@@ -35,7 +35,7 @@ test-same-ip-no-conflict:
   // Inject authoritative response with same IP — not a conflict.
   answers := [dns.AResource hostname 120 local-ip --flush=true]
   packet := dns.create-dns-packet [] answers --id=0 --is-response=true --is-authoritative=true
-  sm.process-packet packet
+  sm.process-packet (dns-helper.parse packet)
 
   expect-equals hostname sm.hostname
   sm.stop
@@ -61,7 +61,7 @@ test-authoritative-response-conflict:
   other-ip := net.IpAddress.parse "192.168.1.99"
   answers := [dns.AResource hostname 120 other-ip --flush=true]
   packet := dns.create-dns-packet [] answers --id=0 --is-response=true --is-authoritative=true
-  sm.process-packet packet
+  sm.process-packet (dns-helper.parse packet)
 
   expect-equals "tiebreak-2.local" sm.hostname
   sm.stop
@@ -96,7 +96,7 @@ test-tiebreak-we-win:
       --id=0
       --is-response=false
       --authorities=authorities
-  sm.process-packet packet
+  sm.process-packet (dns-helper.parse packet)
 
   // We win — no rename, no deferral.
   expect-equals hostname sm.hostname
@@ -134,7 +134,7 @@ test-tiebreak-we-lose:
       --id=0
       --is-response=false
       --authorities=authorities
-  sm.process-packet packet
+  sm.process-packet (dns-helper.parse packet)
 
   // Right after losing a tiebreak, the hostname should NOT have changed yet.
   // The host defers by waiting 1s and re-probing (RFC 6762 Section 8.2).

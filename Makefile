@@ -1,5 +1,7 @@
 all: test
 
+TOIT_EXEC ?= toit
+
 .PHONY: build/CMakeCache.txt
 build/CMakeCache.txt:
 	$(MAKE) rebuild-cmake
@@ -12,6 +14,6 @@ test: install-pkgs rebuild-cmake
 
 rebuild-cmake:
 	mkdir -p build
-	cmake -B build -DCMAKE_BUILD_TYPE=Debug
+	cmake -B build -DCMAKE_BUILD_TYPE=Debug -DTOIT_EXEC=$(TOIT_EXEC)
 
 .PHONY: all test rebuild-cmake install-pkgs
