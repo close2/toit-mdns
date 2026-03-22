@@ -79,23 +79,27 @@ test-multi-hostname:
 resolve socket/MdnsSocket name/string -> bool:
   socket.send (dns.create-dns-packet [dns.Question name dns.RECORD-A] [] --is-response=false --id=0x1111)
   10.repeat:
-    datagram := socket.receive
-    if datagram:
-      parsed := dns.decode-packet datagram.data
-      if parsed.is-response:
-        parsed.resources.do: | res |
-          if res.name == name and res.type == dns.RECORD-A:
-            return true
+    exception := catch:
+      with-timeout (Duration --ms=1500):
+        datagram := socket.receive
+        if datagram:
+          parsed := dns.decode-packet datagram.data
+          if parsed.is-response:
+            parsed.resources.do: | res |
+              if res.name == name and res.type == dns.RECORD-A:
+                return true
   return false
 
 resolve-srv socket/MdnsSocket name/string -> dns.SrvResource:
   socket.send (dns.create-dns-packet [dns.Question name dns.RECORD-SRV] [] --is-response=false --id=0x2222)
   10.repeat:
-    datagram := socket.receive
-    if datagram:
-      parsed := dns.decode-packet datagram.data
-      if parsed.is-response:
-        parsed.resources.do: | res |
-          if res.name == name and res.type == dns.RECORD-SRV:
-            return res as dns.SrvResource
+    exception := catch:
+      with-timeout (Duration --ms=1500):
+        datagram := socket.receive
+        if datagram:
+          parsed := dns.decode-packet datagram.data
+          if parsed.is-response:
+            parsed.resources.do: | res |
+              if res.name == name and res.type == dns.RECORD-SRV:
+                return res as dns.SrvResource
   throw "SRV NOT FOUND for $name"

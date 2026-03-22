@@ -98,11 +98,11 @@ class StateManager:
   static CONFLICT-RATE-LIMIT-WINDOW-US_ ::= 10_000_000  // 10 seconds.
   static CONFLICT-RATE-LIMIT-DELAY-MS_ ::= 5_000  // 5 seconds.
 
-  // RFC 6762 §6.16: Response rate limiting.
-  // Simplified to a global per-manager cooldown. The RFC requires
-  // per-record tracking, but this conservative approach never sends
-  // faster than allowed.
-  last-multicast-time_ := 0 // Monotonic-us of last multicast response.
+  // RFC 6762 §6: "A Multicast DNS responder MUST NOT multicast the
+  //   same resource record on a given interface more frequently than
+  //   once per second."
+  // Tracked per record (name+type) as the RFC requires.
+  last-multicast-times_ := {:}  // Map<string, int> — "name:type" → monotonic-us
 
   services_/List := [] // List<RegisteredService>
 
@@ -427,16 +427,19 @@ class StateManager:
        
     // Send Multicast
     if not multicast-answers.is-empty:
-      // RFC 6762 §6.16: Rate limit multicast responses to 1/s/record.
-      // Skip rather than sleep to avoid blocking the receive loop.
+      // RFC 6762 §6: Per-record rate limiting — suppress only records
+      // already sent within the last second.
       now := Time.monotonic-us
-      elapsed-us := now - last-multicast-time_
-      if last-multicast-time_ != 0 and elapsed-us < 1_000_000:
-        return
-      last-multicast-time_ = now
+      filtered := multicast-answers.filter: | rec |
+        key := "$rec.name:$rec.type"
+        last := last-multicast-times_.get key
+        not last or (now - last) >= 1_000_000
+      if filtered.is-empty: return
+      filtered.do: | rec |
+        last-multicast-times_["$rec.name:$rec.type"] = now
 
       // For Multicast, ID must be 0 (RFC 6762 §18.1)
-      packet := dns.create-dns-packet [] multicast-answers --id=0 --is-response --is-authoritative
+      packet := dns.create-dns-packet [] filtered --id=0 --is-response --is-authoritative
       socket_.send packet // Uses default multicast target
 
   find-question_ query/dns.DecodedPacket? name/string -> dns.Question?:
