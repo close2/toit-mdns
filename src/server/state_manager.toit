@@ -266,13 +266,13 @@ class StateManager:
         jitter-ms := random 251  // 0..250 inclusive
         sleep (Duration --ms=jitter-ms)
 
-        while state_ == STATE-PROBING and probe-count_ < 3:
+        while state_ == STATE-PROBING and probe-count_ < 3 and not stopped_:
           probe-count_++
           first-probe-sent_ = true
           send-probe_
           sleep (Duration --ms=250)
         
-        if state_ == STATE-PROBING:
+        if state_ == STATE-PROBING and not stopped_:
           enter-announcing_
       finally:
         // If enter-probing_ was called again (e.g. because of a rename),
@@ -316,12 +316,14 @@ class StateManager:
     send-announcement_
     sleep (Duration --s=1)
     // Only send the second announcement if we haven't been moved
-    // back to probing (e.g. by a conflict during the 1s wait).
-    if state_ == STATE-ANNOUNCING:
+    // back to probing (e.g. by a conflict during the 1s wait)
+    // and we haven't been stopped.
+    if state_ == STATE-ANNOUNCING and not stopped_:
       send-announcement_
     // Transition to established
-    state_ = STATE-ESTABLISHED
-    log.info "Service established" --tags={"hostname": hostname_, "ip": local-ip_}
+    if not stopped_:
+      state_ = STATE-ESTABLISHED
+      log.info "Service established" --tags={"hostname": hostname_, "ip": local-ip_}
 
   send-probe_:
     questions := [dns.Question hostname_ dns.RECORD-ANY]
@@ -339,11 +341,7 @@ class StateManager:
         --is-response=false
         --authorities=authorities
     
-    // The socket might be closed if the service is shut down while we are
-    // in the probing loop. The loop checks state_ at the top, but the
-    // socket close happens asynchronously in another task (on stop).
-    if socket_.is-closed: return
-    socket_.send packet
+    safe-send_ packet
 
   send-announcement_:
     questions := []
@@ -361,7 +359,7 @@ class StateManager:
       answers.add (dns.TxtResource s.full-name 4500 true txt-list)
        
     packet := dns.create-dns-packet questions answers --id=0 --is-response --is-authoritative
-    socket_.send packet
+    safe-send_ packet
 
   /**
   Sends a response to a query.
@@ -423,7 +421,7 @@ class StateManager:
       id := query ? query.id : 0
       // RFC 6762 §18.3: ID must match for legacy/unicast responses.
       packet := dns.create-dns-packet [] unicast-answers --id=id --is-response --is-authoritative
-      socket_.send packet source
+      safe-send_ packet source
        
     // Send Multicast
     if not multicast-answers.is-empty:
@@ -440,7 +438,24 @@ class StateManager:
 
       // For Multicast, ID must be 0 (RFC 6762 §18.1)
       packet := dns.create-dns-packet [] filtered --id=0 --is-response --is-authoritative
-      socket_.send packet // Uses default multicast target
+      safe-send_ packet // Uses default multicast target
+
+  /**
+  Sends a packet on the socket, silently ignoring errors if the socket
+  is closed or the network route is unavailable (e.g. multicast on macOS
+  when no route exists). This prevents background probing/announcing
+  tasks from crashing when the service is shut down concurrently.
+  */
+  safe-send_ packet/ByteArray remote/net.SocketAddress?=null:
+    if socket_.is-closed: return
+    if stopped_: return
+    // Catch send errors (e.g. NOT_CONNECTED, CLOSED) but only print
+    // the trace if the error is unexpected (i.e. we're not shutting down).
+    catch --trace=(: | _ _ | not stopped_ and not socket_.is-closed):
+      if remote:
+        socket_.send packet remote
+      else:
+        socket_.send packet
 
   find-question_ query/dns.DecodedPacket? name/string -> dns.Question?:
     if not query: return null
