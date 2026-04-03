@@ -13,7 +13,7 @@ jobs:
     strategy:
       matrix:
         os: [ ubuntu-latest, windows-latest, macos-latest ]
-        toit-version: [ v2.0.0-alpha.180, latest ]
+        toit-version: [ v2.0.0-alpha.191, latest ]
         include:
           - toit-version: v2.0.0-alpha.180
             version-name: old
