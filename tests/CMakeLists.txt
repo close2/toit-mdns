@@ -5,15 +5,23 @@ list(FILTER TESTS EXCLUDE REGEX "^esp32-")
 list(FILTER TESTS EXCLUDE REGEX "^pc-")
 
 find_program(TOIT_EXEC toit)
-if(NOT TOIT_EXEC)
-    # Fallback if find_program fails (e.g., if it's not in PATH yet)
-    set(TOIT_EXEC "toit${CMAKE_EXECUTABLE_SUFFIX}")
+
+if(TOIT_EXEC)
+    separate_arguments(TOIT_CMD NATIVE_COMMAND "${TOIT_EXEC}")
+else()
+    find_program(JAG_EXEC jag)
+    if(JAG_EXEC)
+        set(TOIT_CMD "${JAG_EXEC}" toit)
+    else()
+        # Fallback if find_program fails (e.g., if it's not in PATH yet)
+        set(TOIT_CMD "toit${CMAKE_EXECUTABLE_SUFFIX}")
+    endif()
 endif()
 set(TEST_TIMEOUT 40 CACHE STRING "The maximal amount of time each test is allowed to run")
 
 add_custom_target(
   "install-pkgs"
-  COMMAND "${TOIT_EXEC}" pkg install
+  COMMAND ${TOIT_CMD} pkg install
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
@@ -30,7 +38,7 @@ foreach(file ${TESTS})
   set(test_name "/tests/${file}")
   add_test(
     NAME "${test_name}"
-    COMMAND "${TOIT_EXEC}" "tests/${file}"
+    COMMAND ${TOIT_CMD} "tests/${file}"
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   )
   set_tests_properties(${test_name} PROPERTIES TIMEOUT ${TEST_TIMEOUT})

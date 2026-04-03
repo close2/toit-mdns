@@ -8,11 +8,19 @@ on:
   release:
     types: [published]
 
+env:
+  # Branch of the Toit SDK that contains the UDP_REUSE_PORT fix for Windows.
+  # Once the fix is merged into an official SDK release, this workflow can
+  # revert to using toitlang/action-setup with a released version on all
+  # platforms.
+  TOIT_SDK_BRANCH: CL/fix-udp-reuse-port-windows
+
 jobs:
+  # ---------- Linux & macOS: use pre-built SDK releases ----------
   build:
     strategy:
       matrix:
-        os: [ ubuntu-latest, windows-latest, macos-latest ]
+        os: [ ubuntu-latest, macos-latest ]
         toit-version: [ v2.0.0-alpha.191, latest ]
         include:
           - toit-version: v2.0.0-alpha.191
@@ -38,17 +46,96 @@ jobs:
             sudo ip link set lo up
             sudo route add -net 224.0.0.0 netmask 240.0.0.0 dev lo
           elif [ "${{ runner.os }}" = "macOS" ]; then
-            # Ensure loopback is up and supports multicast
             sudo ifconfig lo0 up
-            # Add the general multicast route
             sudo route -n add -net 224.0.0.0/4 -interface lo0
-            # Explicitly route the mDNS group to loopback
             sudo route -n add -host 224.0.0.251 -interface lo0
           fi
 
       - name: Test
+        run: make test
+
+      - name: Setup tmate session
+        if: ${{ failure() }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+
+  # ---------- Windows: build SDK from source (includes UDP_REUSE_PORT fix) ----------
+  build-windows:
+    name: CI - windows-latest
+
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- Build Toit SDK from source ---
+      - name: Checkout Toit SDK
+        uses: actions/checkout@v4
+        with:
+          repository: toitlang/toit
+          ref: ${{ env.TOIT_SDK_BRANCH }}
+          path: toit-sdk
+          fetch-depth: 0
+
+      - name: Initialize SDK submodules (mbedtls only)
+        shell: bash
         run: |
-          make test
+          cd toit-sdk/third_party/esp-idf
+          git submodule update --init .
+          git submodule update --init components/mbedtls
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: toit-sdk/tools/**/go.sum
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install jsonschema jinja2
+
+      - name: Install ccache
+        shell: bash
+        run: choco install ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-windows-${{ github.sha }}
+          restore-keys: ccache-windows-
+
+      - name: Build Toit SDK
+        shell: bash
+        env:
+          IDF_PATH: ${{ github.workspace }}/toit-sdk/third_party/esp-idf
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_COMPRESS: "true"
+          CCACHE_COMPRESSLEVEL: "6"
+          CCACHE_MAXSIZE: "400M"
+        run: |
+          cd toit-sdk
+          make IGNORE_GIT_TAGS=1 sdk
+
+      - name: Add Toit SDK to PATH
+        shell: bash
+        run: |
+          SDK_BIN=$(cygpath -w "${{ github.workspace }}/toit-sdk/build/host/sdk/bin")
+          echo "$SDK_BIN" >> "$GITHUB_PATH"
+
+      - name: Verify toit is available
+        shell: bash
+        run: toit version
+
+      # --- Run mdns tests ---
+      - name: Test
+        run: make test
 
       - name: Setup tmate session
         if: ${{ failure() }}
