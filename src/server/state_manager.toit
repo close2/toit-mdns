@@ -347,7 +347,10 @@ class StateManager:
         --authorities=authorities
     
     if socket_.is-closed: return
-    socket_.send packet
+    // Multicast sends are best-effort. On some platforms (e.g. macOS),
+    // sendto() to a multicast address may fail with NOT_CONNECTED when
+    // no valid route exists.  The protocol recovers via re-probing.
+    catch --trace: socket_.send packet
 
   send-announcement_:
     questions := []
@@ -366,7 +369,8 @@ class StateManager:
        
     packet := dns.create-dns-packet questions answers --id=0 --is-response --is-authoritative
     if socket_.is-closed: return
-    socket_.send packet
+    // Best-effort — see send-probe_ comment.
+    catch --trace: socket_.send packet
 
   /**
   Sends a response to a query.
