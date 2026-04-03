@@ -11,6 +11,9 @@ on:
 jobs:
   build:
     strategy:
+      # Don't cancel all jobs if one fails — Windows needs SDK fix
+      # (toitlang/toit#3013) before it can pass.
+      fail-fast: false
       matrix:
         os: [ ubuntu-latest, windows-latest, macos-latest ]
         toit-version: [ v2.0.0-alpha.191, latest ]
