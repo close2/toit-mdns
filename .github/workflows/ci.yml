@@ -15,7 +15,7 @@ jobs:
         os: [ ubuntu-latest, windows-latest, macos-latest ]
         toit-version: [ v2.0.0-alpha.191, latest ]
         include:
-          - toit-version: v2.0.0-alpha.180
+          - toit-version: v2.0.0-alpha.191
             version-name: old
           - toit-version: latest
             version-name: new
