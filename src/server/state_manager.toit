@@ -146,6 +146,11 @@ class StateManager:
 
   /**
   Stops the probing/announcing process and cancels any pending timers.
+
+  Cancelling the background task causes a $CANCELED-ERROR at its next
+  yield point (sleep or monitor await), which propagates through any
+  $catch blocks and runs the task's finally clause — this is Toit's
+  standard cooperative cancellation mechanism.
   */
   stop:
     stopped_ = true
@@ -247,7 +252,9 @@ class StateManager:
 
     if probe-timer_: probe-timer_.cancel
 
-    // 2. Start the probing loop in a task
+    // 2. Start the probing loop in a task.
+    //    Cancellation (from $stop or a new call to $enter-probing_) fires
+    //    at the next sleep, propagating through catch as CANCELED-ERROR.
     probe-timer_ = task::
       try:
         // RFC 6762 §8.7: After 15 conflicts in 10 seconds,
@@ -266,13 +273,13 @@ class StateManager:
         jitter-ms := random 251  // 0..250 inclusive
         sleep (Duration --ms=jitter-ms)
 
-        while state_ == STATE-PROBING and probe-count_ < 3 and not stopped_:
+        while state_ == STATE-PROBING and probe-count_ < 3:
           probe-count_++
           first-probe-sent_ = true
           send-probe_
           sleep (Duration --ms=250)
         
-        if state_ == STATE-PROBING and not stopped_:
+        if state_ == STATE-PROBING:
           enter-announcing_
       finally:
         // If enter-probing_ was called again (e.g. because of a rename),
@@ -316,14 +323,12 @@ class StateManager:
     send-announcement_
     sleep (Duration --s=1)
     // Only send the second announcement if we haven't been moved
-    // back to probing (e.g. by a conflict during the 1s wait)
-    // and we haven't been stopped.
-    if state_ == STATE-ANNOUNCING and not stopped_:
+    // back to probing (e.g. by a conflict during the 1s wait).
+    if state_ == STATE-ANNOUNCING:
       send-announcement_
     // Transition to established
-    if not stopped_:
-      state_ = STATE-ESTABLISHED
-      log.info "Service established" --tags={"hostname": hostname_, "ip": local-ip_}
+    state_ = STATE-ESTABLISHED
+    log.info "Service established" --tags={"hostname": hostname_, "ip": local-ip_}
 
   send-probe_:
     questions := [dns.Question hostname_ dns.RECORD-ANY]
@@ -341,7 +346,8 @@ class StateManager:
         --is-response=false
         --authorities=authorities
     
-    safe-send_ packet
+    if socket_.is-closed: return
+    socket_.send packet
 
   send-announcement_:
     questions := []
@@ -359,7 +365,8 @@ class StateManager:
       answers.add (dns.TxtResource s.full-name 4500 true txt-list)
        
     packet := dns.create-dns-packet questions answers --id=0 --is-response --is-authoritative
-    safe-send_ packet
+    if socket_.is-closed: return
+    socket_.send packet
 
   /**
   Sends a response to a query.
@@ -421,7 +428,7 @@ class StateManager:
       id := query ? query.id : 0
       // RFC 6762 §18.3: ID must match for legacy/unicast responses.
       packet := dns.create-dns-packet [] unicast-answers --id=id --is-response --is-authoritative
-      safe-send_ packet source
+      socket_.send packet source
        
     // Send Multicast
     if not multicast-answers.is-empty:
@@ -438,24 +445,7 @@ class StateManager:
 
       // For Multicast, ID must be 0 (RFC 6762 §18.1)
       packet := dns.create-dns-packet [] filtered --id=0 --is-response --is-authoritative
-      safe-send_ packet // Uses default multicast target
-
-  /**
-  Sends a packet on the socket, silently ignoring errors if the socket
-  is closed or the network route is unavailable (e.g. multicast on macOS
-  when no route exists). This prevents background probing/announcing
-  tasks from crashing when the service is shut down concurrently.
-  */
-  safe-send_ packet/ByteArray remote/net.SocketAddress?=null:
-    if socket_.is-closed: return
-    if stopped_: return
-    // Catch send errors (e.g. NOT_CONNECTED, CLOSED) but only print
-    // the trace if the error is unexpected (i.e. we're not shutting down).
-    catch --trace=(: | _ _ | not stopped_ and not socket_.is-closed):
-      if remote:
-        socket_.send packet remote
-      else:
-        socket_.send packet
+      socket_.send packet // Uses default multicast target
 
   find-question_ query/dns.DecodedPacket? name/string -> dns.Question?:
     if not query: return null
