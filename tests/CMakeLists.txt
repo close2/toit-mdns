@@ -7,6 +7,8 @@ list(FILTER TESTS EXCLUDE REGEX "^pc-")
 set(TOIT_EXEC "toit${CMAKE_EXECUTABLE_SUFFIX}" CACHE FILEPATH "The executable used to run the tests")
 set(TEST_TIMEOUT 40 CACHE STRING "The maximal amount of time each test is allowed to run")
 
+message("${TOIT_EXEC}")
+
 add_custom_target(
   "install-pkgs"
   COMMAND "${TOIT_EXEC}" pkg install
