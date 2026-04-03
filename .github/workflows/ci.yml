@@ -38,7 +38,12 @@ jobs:
             sudo ip link set lo up
             sudo route add -net 224.0.0.0 netmask 240.0.0.0 dev lo
           elif [ "${{ runner.os }}" = "macOS" ]; then
+            # Ensure loopback is up and supports multicast
+            sudo ifconfig lo0 up
+            # Add the general multicast route
             sudo route -n add -net 224.0.0.0/4 -interface lo0
+            # Explicitly route the mDNS group to loopback
+            sudo route -n add -host 224.0.0.251 -interface lo0
           fi
 
       - name: Test
