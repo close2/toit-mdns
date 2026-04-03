@@ -4,10 +4,12 @@ file(GLOB TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "*-test.toit" "*_test.toit"
 list(FILTER TESTS EXCLUDE REGEX "^esp32-")
 list(FILTER TESTS EXCLUDE REGEX "^pc-")
 
-set(TOIT_EXEC "toit${CMAKE_EXECUTABLE_SUFFIX}" CACHE FILEPATH "The executable used to run the tests")
+find_program(TOIT_EXEC toit)
+if(NOT TOIT_EXEC)
+    # Fallback if find_program fails (e.g., if it's not in PATH yet)
+    set(TOIT_EXEC "toit${CMAKE_EXECUTABLE_SUFFIX}")
+endif()
 set(TEST_TIMEOUT 40 CACHE STRING "The maximal amount of time each test is allowed to run")
-
-message("${TOIT_EXEC}")
 
 add_custom_target(
   "install-pkgs"
