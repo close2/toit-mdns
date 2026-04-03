@@ -25,12 +25,22 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - uses: toitlang/action-setup@v1
         with:
           toit-version: ${{ matrix.toit-version }}
-          
+
+      - name: Setup Multicast Route
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo ip link set lo up
+            sudo route add -net 224.0.0.0 netmask 240.0.0.0 dev lo
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            sudo route -n add -net 224.0.0.0/4 -interface lo0
+          fi
+
       - name: Test
         run: |
           make test
