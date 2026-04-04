@@ -11,19 +11,11 @@ on:
 jobs:
   build:
     strategy:
-      # Don't cancel all jobs if one fails — Windows needs SDK fix
-      # (toitlang/toit#3013) before it can pass.
       fail-fast: false
       matrix:
         os: [ ubuntu-latest, windows-latest, macos-latest ]
-        toit-version: [ v2.0.0-alpha.191, latest ]
-        include:
-          - toit-version: v2.0.0-alpha.191
-            version-name: old
-          - toit-version: latest
-            version-name: new
 
-    name: CI - ${{ matrix.os }} - ${{ matrix.version-name }}
+    name: CI - ${{ matrix.os }}
 
     runs-on: ${{ matrix.os }}
 
@@ -31,19 +23,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: toitlang/action-setup@v1
-        with:
-          toit-version: ${{ matrix.toit-version }}
 
       - name: Setup Multicast Route
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
             sudo ip link set lo up
-            sudo route add -net 224.0.0.0 netmask 240.0.0.0 dev lo
+            sudo route add -net 224.0.0.0 netmask 240.0.0.0 dev lo || true
           elif [ "${{ runner.os }}" = "macOS" ]; then
             sudo ifconfig lo0 up
-            sudo route -n add -net 224.0.0.0/4 -interface lo0
-            sudo route -n add -host 224.0.0.251 -interface lo0
+            sudo route -n add -net 224.0.0.0/4 -interface lo0 || true
           fi
 
       - name: Test

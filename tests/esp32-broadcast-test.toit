@@ -3,12 +3,10 @@ Test both broadcast AND unicast-to-multicast-port between ESP32s.
 This helps narrow down whether the issue is multicast-MAC-specific.
 
 Run on both ESP32s:
-  build/jag run --device <IP> \
-    third_party/toit.worktree1/toit-mdns.v4/tests/esp32-broadcast-test.toit
+  jag run --device <IP> tests/esp32-broadcast-test.toit
 */
 import net
-import net.modules.udp as udp-impl
-import net.udp as udp
+import net.udp
 
 BCAST-ADDR ::= net.IpAddress #[255, 255, 255, 255]
 TEST-PORT ::= 5355
@@ -19,12 +17,12 @@ main:
   print "=== Broadcast + unicast test on $my-ip ==="
 
   // Receiver socket: bound to our test port with broadcast enabled.
-  rx := udp-impl.Socket network "0.0.0.0" TEST-PORT
+  rx := network.udp-open --port=TEST-PORT
   rx.broadcast = true
   print "Listening on 0.0.0.0:$TEST-PORT"
 
   // Sender socket.
-  tx := udp-impl.Socket network "0.0.0.0" 0
+  tx := network.udp-open
   tx.broadcast = true
 
   // Determine the other ESP32's address.

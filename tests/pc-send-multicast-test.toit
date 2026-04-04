@@ -3,8 +3,7 @@ PC-side test: sends mDNS multicast packets that an ESP32 on the same
 network should be able to receive.
 
 Run on the development PC with:
-  build/host/sdk/lib/toit/bin/toit.run \
-      toit-mdns.v4/tests/pc-send-multicast-test.toit
+  toit tests/pc-send-multicast-test.toit
 
 While an ESP32 runs the companion esp32-receive-multicast-test.toit,
 use `jag monitor` to check if the ESP32 receives these packets.
@@ -15,10 +14,10 @@ packets, and the receiver task (on the same host) verifies receipt.
 import expect show *
 import monitor
 import net
-import net.modules.udp as udp-impl
-import net.udp as udp
+import net.udp
 
 MDNS-GROUP ::= net.IpAddress #[224, 0, 0, 251]
+LOOPBACK-ADDRESS ::= net.IpAddress.parse "127.0.0.1"
 // Use the standard mDNS port so the ESP32's multicast socket picks it up.
 MDNS-PORT ::= 5353
 // Also test on a non-standard port for a cleaner two-party test.
@@ -47,12 +46,12 @@ loopback-test network/net.Client:
   done := monitor.Channel 1
 
   task::
-    socket := udp-impl.Socket.multicast network
-        MDNS-GROUP
-        TEST-PORT
+    socket := network.udp-open-multicast
+        --port=TEST-PORT
         --reuse-address
         --reuse-port
         --loopback
+    socket.multicast-add-membership MDNS-GROUP
     ready.send socket.local-address.port
     datagram/udp.Datagram? := null
     with-timeout (Duration --s=5):
@@ -67,7 +66,7 @@ loopback-test network/net.Client:
 
   actual-port := ready.receive
 
-  sender := udp-impl.Socket network "0.0.0.0" 0
+  sender := network.udp-open-multicast --if-addr=LOOPBACK-ADDRESS --loopback
   sender.send
       udp.Datagram
           "loopback-ping".to-byte-array
@@ -86,7 +85,7 @@ cross-device-send network/net.Client:
   print "=== Sending multicast to mDNS group (224.0.0.251:$MDNS-PORT) ==="
   print "    ESP32 should print received packets.  30 packets, 1/sec."
 
-  sender := udp-impl.Socket network "0.0.0.0" 0
+  sender := network.udp-open-multicast --loopback
   30.repeat: | i |
     payload := "mcast-probe-$i"
     sender.send

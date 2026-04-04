@@ -4,11 +4,10 @@ Also periodically sends multicast packets that Wireshark/tcpdump on the
 PC should be able to capture.
 
 Flash and run on ESP32:
-  ESPTOOL_PATH=/usr/bin/esptool build/jag run \
-      toit-mdns.v4/tests/esp32-receive-multicast-test.toit
+  jag run tests/esp32-receive-multicast-test.toit
 
 Monitor output:
-  ESPTOOL_PATH=/usr/bin/esptool build/jag monitor | tee /tmp/esp32-mcast.log
+  jag monitor | tee /tmp/esp32-mcast.log
 
 On the PC, run the companion pc-send-multicast-test.toit to generate
 traffic that this program should receive.
@@ -17,8 +16,7 @@ Also capture ESP32's outgoing packets:
   sudo tcpdump -i <wifi-iface> -n 'udp port 5353' -v
 */
 import net
-import net.modules.udp as udp-impl
-import net.udp as udp
+import net.udp
 
 MDNS-GROUP ::= net.IpAddress #[224, 0, 0, 251]
 MDNS-PORT ::= 5353
@@ -28,13 +26,13 @@ main:
   print "ESP32 multicast test starting..."
   print "Local IP: $network.address"
 
-  // Create a multicast socket bound to the mDNS group.
-  socket := udp-impl.Socket.multicast network
-      MDNS-GROUP
-      MDNS-PORT
+  // Create a multicast socket and join the mDNS group.
+  socket := network.udp-open-multicast
+      --port=MDNS-PORT
       --reuse-address
       --reuse-port
       --loopback
+  socket.multicast-add-membership MDNS-GROUP
 
   print "Joined multicast group 224.0.0.251 on port $MDNS-PORT"
   print "Local address: $socket.local-address"
@@ -42,7 +40,7 @@ main:
   // Sender task: send a multicast packet every 2 seconds.
   // The PC's Wireshark/tcpdump should see these.
   task::
-    sender-socket := udp-impl.Socket network "0.0.0.0" 0
+    sender-socket := network.udp-open-multicast --loopback
     print "Sender task started (sending every 2s)..."
     50.repeat: | i |
       payload := "esp32-mcast-$i"

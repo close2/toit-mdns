@@ -23,8 +23,11 @@ test-wakeup-bug:
   cache := MdnsCache
   engine := QueryEngine socket cache
 
-  // Sender socket to inject packets
-  sender := network.udp-open
+  // Sender socket to inject multicast packets.
+  // Uses udp-open-multicast (no group join) so it can send to the
+  // multicast address on all platforms (including macOS which requires
+  // IP_MULTICAST_IF to be configured).
+  sender := network.udp-open-multicast --loopback
   dest := net.SocketAddress TEST-GROUP TEST-PORT
 
   // Start a background lookup for A records

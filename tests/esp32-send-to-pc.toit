@@ -2,12 +2,11 @@
 Minimal test: send unicast UDP to a specific PC IP and port.
 Also send broadcast. Helps verify ESP32 UDP TX works at all.
 
-Run: build/jag run --device <ESP32-IP> \
-       third_party/toit.worktree1/toit-mdns.v4/tests/esp32-send-to-pc.toit
+Run:
+  jag run --device <ESP32-IP> tests/esp32-send-to-pc.toit
 */
 import net
-import net.modules.udp as udp-impl
-import net.udp as udp
+import net.udp
 
 PC-IP ::= net.IpAddress #[10, 0, 100, 191]
 PC-PORT ::= 7777
@@ -19,7 +18,7 @@ main:
   print "My IP: $my-ip"
   print "Target: $PC-IP:$PC-PORT"
 
-  socket := udp-impl.Socket network "0.0.0.0" 0
+  socket := network.udp-open
   socket.broadcast = true
   print "Socket created on port $(socket.local-address.port)"
 

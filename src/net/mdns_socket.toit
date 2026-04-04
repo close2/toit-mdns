@@ -16,9 +16,6 @@ These follow RFC 6762 requirements for mDNS:
 
 import net
 import net.udp
-import net.modules.udp as udp_impl
-import net.modules.dns
-
 
 /// Standard mDNS multicast address (IPv4).
 MDNS-MULTICAST-ADDRESS ::= net.IpAddress #[224, 0, 0, 251]
@@ -32,7 +29,7 @@ Automatically joins the multicast group and caches the target address
 for efficient sending.
 */
 class MdnsSocket:
-  socket_/udp.Socket
+  socket_/udp.MulticastSocket
   mdns-target_/net.SocketAddress
 
   constructor
@@ -40,7 +37,12 @@ class MdnsSocket:
       --group/net.IpAddress=MDNS-MULTICAST-ADDRESS
       --port/int=MDNS-PORT:
     mdns-target_ = net.SocketAddress group port
-    socket_ = udp_impl.Socket.multicast network group port --reuse-address --reuse-port --loopback // We want to hear our own packets for testing/verification usually.
+    socket_ = network.udp-open-multicast
+        --port=port
+        --reuse-address
+        --reuse-port
+        --loopback  // We want to hear our own packets for testing/verification.
+    socket_.multicast-add-membership group
 
   send packet/ByteArray remote/net.SocketAddress=mdns-target_:
     socket_.send (udp.Datagram packet remote)
