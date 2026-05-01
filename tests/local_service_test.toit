@@ -1,7 +1,7 @@
 import expect show *
-import ..src.service as service
-import ..lib.client as client
-import ..src.api.mdns_service show MdnsService
+import mdns.service as service
+import mdns.client as client
+import mdns.api.mdns_service show MdnsService
 
 main:
   test-connect-locally

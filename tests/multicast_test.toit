@@ -2,7 +2,7 @@ import expect show *
 import net
 import net.modules.dns
 
-import ..src.net.mdns_socket
+import mdns.net.mdns_socket show MdnsSocket MDNS-MULTICAST-ADDRESS
 import .e2e_param show TEST-PORT
 
 main:

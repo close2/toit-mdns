@@ -4,9 +4,9 @@ import net
 import net.udp
 import net.modules.dns
 import io
-import ..src.server.query_engine
-import ..src.server.cache
-import ..src.net.mdns_socket
+import mdns.server.query_engine show QueryEngine
+import mdns.server.cache show MdnsCache
+import mdns.net.mdns_socket show MdnsSocket
 
 TEST-PORT ::= 5354
 TEST-GROUP ::= net.IpAddress.parse "224.0.0.251"
@@ -23,8 +23,11 @@ test-wakeup-bug:
   cache := MdnsCache
   engine := QueryEngine socket cache
 
-  // Sender socket to inject packets
-  sender := network.udp-open
+  // Sender socket to inject multicast packets.
+  // Uses udp-open-multicast (no group join) so it can send to the
+  // multicast address on all platforms (including macOS which requires
+  // IP_MULTICAST_IF to be configured).
+  sender := network.udp-open-multicast --loopback
   dest := net.SocketAddress TEST-GROUP TEST-PORT
 
   // Start a background lookup for A records

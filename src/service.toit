@@ -157,7 +157,7 @@ class MdnsServiceProvider extends services.ServiceProvider
     
     if not managers_.contains name:
       cm := ConflictManager
-      manager := StateManager socket_ cm name resolved-local-ip_
+      manager := StateManager socket_ cm name resolved-local-ip_ --expected-port=port
       managers_[name] = manager
       manager.start
 
@@ -200,13 +200,33 @@ class MdnsServiceProvider extends services.ServiceProvider
           
           packet-bytes := datagram.data
           
-          // Broadcast to all state managers
+          // Parse once to validate the packet. Malformed packets from
+          // non-mDNS multicast traffic are silently skipped.
+          decoded/dns.DecodedPacket? := null
+          parse-exception := catch:
+            decoded = dns.parse packet-bytes
+          if parse-exception:
+            log.debug "mDNS ignoring malformed packet" --tags={"error": parse-exception}
+            continue
+
+          // Broadcast to all state managers (per-manager isolation).
           managers_.do: | name manager/StateManager |
-            manager.process-packet packet-bytes --source=datagram.address
-          
-          // Allow QueryEngine to process answers/updates
-          decoded := dns.parse packet-bytes
-          query-engine_.process-packet decoded
+            manager-exception := catch:
+              manager.process-packet decoded --source=datagram.address
+            if manager-exception:
+              log.warn "mDNS manager processing error"
+                  --tags={"error": manager-exception, "manager": name}
+
+          // Allow QueryEngine to process answers/updates.
+          // RFC 6762 §7.3: "A Multicast DNS querier MUST NOT cache
+          //  resource records observed in the Known-Answer Section of
+          //  other Multicast DNS queries." — Only cache from responses.
+          if decoded.is-response:
+            query-exception := catch:
+              query-engine_.process-packet decoded
+            if query-exception:
+              log.warn "mDNS query-engine processing error"
+                  --tags={"error": query-exception}
         if exception:
           if not closed_: log.error "mDNS receive error" --tags={"error": exception}
           break

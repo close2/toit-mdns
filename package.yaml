@@ -2,4 +2,4 @@ name: mdns
 description: mDNS publisher and client library.
 
 environment:
-  sdk: ^2.0.0-alpha.180
+  sdk: ^2.0.0-alpha.191

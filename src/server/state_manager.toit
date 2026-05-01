@@ -80,23 +80,41 @@ class StateManager:
   conflict-manager_/ConflictManager
   local-ip_/net.IpAddress
   hostname_/string := ? // Mutable
+  expected-port_/int  // RFC 6762 §6.10: port we validate responses from.
   
   probe-count_ := 0
   probe-timer_/Task? := null
+  first-probe-sent_/bool := false
+  stopped_/bool := false
   
   // Conflict defense counters
   defend-count_ := 0
   last-defend-time_ := 0
+
+  // RFC 6762 §8.1: After 15 rapid conflicts, rate-limit probing.
+  conflict-count_ := 0
+  conflict-window-start_ := 0
+  static CONFLICT-RATE-LIMIT-THRESHOLD_ ::= 15
+  static CONFLICT-RATE-LIMIT-WINDOW-US_ ::= 10_000_000  // 10 seconds.
+  static CONFLICT-RATE-LIMIT-DELAY-MS_ ::= 5_000  // 5 seconds.
+
+  // RFC 6762 §6: "A Multicast DNS responder MUST NOT multicast the
+  //   same resource record on a given interface more frequently than
+  //   once per second."
+  // Tracked per record (name+type) as the RFC requires.
+  last-multicast-times_ := {:}  // Map<string, int> — "name:type" → monotonic-us
 
   services_/List := [] // List<RegisteredService>
 
   /**
   Creates a new StateManager.
   The [hostname] must end with ".local".
+  The [expected-port] defaults to 5353 per RFC 6762 §6.10.
   */
-  constructor .socket_ .conflict-manager_ hostname/string .local-ip_:
+  constructor .socket_ .conflict-manager_ hostname/string .local-ip_ --expected-port/int=5353:
     assert: hostname.ends-with ".local"
     hostname_ = hostname
+    expected-port_ = expected-port
   
   /**
   Registers a service to be announced.
@@ -128,8 +146,14 @@ class StateManager:
 
   /**
   Stops the probing/announcing process and cancels any pending timers.
+
+  Cancelling the background task causes a $CANCELED-ERROR at its next
+  yield point (sleep or monitor await), which propagates through any
+  $catch blocks and runs the task's finally clause — this is Toit's
+  standard cooperative cancellation mechanism.
   */
   stop:
+    stopped_ = true
     if probe-timer_: 
       probe-timer_.cancel
       probe-timer_ = null
@@ -149,11 +173,45 @@ class StateManager:
   /**
   Processes an incoming mDNS packet.
   Called from the service for every packet.
-  Parses the packet and triggers conflict detection/defense or query responses.
+  Triggers conflict detection/defense or query responses.
   */
-  process-packet packet/ByteArray --source/net.SocketAddress?=null:
-    decoded := dns.parse packet
-    
+  process-packet decoded/dns.DecodedPacket --source/net.SocketAddress?=null:
+    // RFC 6762 §18.3, §18.11: Reject non-zero OPCODE or RCODE.
+    if not dns.is-valid-mdns-message decoded: return
+
+    // RFC 6762 §6.10: Reject responses not from the expected mDNS port.
+    if decoded.is-response and source:
+      if source.port != expected-port_: return
+
+    // --- Simultaneous Probe Tiebreaking (RFC 6762 Section 8.2) ---
+    // If we're probing and we see another probe for the same name,
+    // compare our proposed rdata with theirs lexicographically.
+    if state_ == STATE-PROBING and dns.is-probe-for decoded hostname_:
+      their-addrs := dns.get-authority-addresses decoded hostname_
+      if not their-addrs.is-empty:
+        // Compare our IP against each of their proposed IPs.
+        // Per RFC 6762, the lexicographically later rdata wins.
+        we-lose := their-addrs.any: | their-ip/net.IpAddress |
+          (dns.compare-addresses local-ip_ their-ip) < 0
+        if we-lose:
+          // We lose the tiebreak. Wait 1 second, then re-probe.
+          // (The other host will complete probing and claim the name;
+          // when we re-probe, we'll see their response and rename.)
+          log.info "Probe tiebreak lost, deferring" --tags={"hostname": hostname_}
+          if probe-timer_: probe-timer_.cancel
+          probe-timer_ = task::
+            try:
+              sleep (Duration --s=1)
+              enter-probing_
+            finally:
+              if probe-timer_ == Task.current: probe-timer_ = null
+          return
+
+    // --- Conflict detection from authoritative responses ---
+    // RFC 6762 §8.5: Responses received *before* the first probe
+    // packet is sent MUST be silently ignored.
+    if state_ == STATE-PROBING and not first-probe-sent_: return
+
     if dns.is-authoritative-response-for decoded hostname_:
       // Check if RData is different (RFC 6762 Section 9)
       is-conflict := false
@@ -185,18 +243,39 @@ class StateManager:
       send-response_ decoded --source=source
 
   enter-probing_:
+    if stopped_: return
     // 1. Critical: Update state synchronously to prevent re-entry
     state_ = STATE-PROBING
     probe-count_ = 0
+    first-probe-sent_ = false
     defend-count_ = 0 // Reset defense count
 
     if probe-timer_: probe-timer_.cancel
 
-    // 2. Start the probing loop in a task
+    // 2. Start the probing loop in a task.
+    //    Cancellation (from $stop or a new call to $enter-probing_) fires
+    //    at the next sleep, propagating through catch as CANCELED-ERROR.
     probe-timer_ = task::
       try:
+        // RFC 6762 §8.7: After 15 conflicts in 10 seconds,
+        // wait at least 5 seconds before each successive attempt.
+        now := Time.monotonic-us
+        if now - conflict-window-start_ > CONFLICT-RATE-LIMIT-WINDOW-US_:
+          conflict-count_ = 0
+          conflict-window-start_ = now
+        if conflict-count_ >= CONFLICT-RATE-LIMIT-THRESHOLD_:
+          log.warn "Rate limiting: too many conflicts" --tags={"count": conflict-count_}
+          sleep (Duration --ms=CONFLICT-RATE-LIMIT-DELAY-MS_)
+
+        // RFC 6762 Section 8.1: Random delay of 0-250ms before first
+        // probe to reduce probability of simultaneous probes from
+        // devices that power on at the same time.
+        jitter-ms := random 251  // 0..250 inclusive
+        sleep (Duration --ms=jitter-ms)
+
         while state_ == STATE-PROBING and probe-count_ < 3:
           probe-count_++
+          first-probe-sent_ = true
           send-probe_
           sleep (Duration --ms=250)
         
@@ -210,6 +289,7 @@ class StateManager:
 
   handle-probing-conflict_:
     if probe-timer_: probe-timer_.cancel
+    conflict-count_++
     // Pick a new name and restart probing
     new-name := conflict-manager_.resolve-probing-conflict hostname_
     hostname_ = new-name
@@ -238,8 +318,14 @@ class StateManager:
 
   enter-announcing_:
     state_ = STATE-ANNOUNCING
-    // Send unsolicited announcement
+    // RFC 6762 §8.3: "The Multicast DNS responder MUST send at least
+    //  two unsolicited responses, one second apart."
     send-announcement_
+    sleep (Duration --s=1)
+    // Only send the second announcement if we haven't been moved
+    // back to probing (e.g. by a conflict during the 1s wait).
+    if state_ == STATE-ANNOUNCING:
+      send-announcement_
     // Transition to established
     state_ = STATE-ESTABLISHED
     log.info "Service established" --tags={"hostname": hostname_, "ip": local-ip_}
@@ -249,15 +335,22 @@ class StateManager:
     // Add Questions for Service Instances too
     services_.do: | s/RegisteredService |
       questions.add (dns.Question s.full-name dns.RECORD-ANY)
-       
-    answers := [] 
-    packet := dns.create-dns-packet questions answers --id=0 --is-response=false
+
+    // RFC 6762 Section 8.2: Include our proposed A record in the
+    // Authority Section so other probers can do tiebreaking.
+    authorities := [dns.AResource hostname_ 120 local-ip_]
+
+    answers := []
+    packet := dns.create-dns-packet questions answers
+        --id=0
+        --is-response=false
+        --authorities=authorities
     
-    // The socket might be closed if the service is shut down while we are
-    // in the probing loop. The loop checks state_ at the top, but the
-    // socket close happens asynchronously in another task (on stop).
     if socket_.is-closed: return
-    socket_.send packet
+    // Multicast sends are best-effort. On some platforms (e.g. macOS),
+    // sendto() to a multicast address may fail with NOT_CONNECTED when
+    // no valid route exists.  The protocol recovers via re-probing.
+    catch --trace: socket_.send packet
 
   send-announcement_:
     questions := []
@@ -275,11 +368,14 @@ class StateManager:
       answers.add (dns.TxtResource s.full-name 4500 true txt-list)
        
     packet := dns.create-dns-packet questions answers --id=0 --is-response --is-authoritative
-    socket_.send packet
+    if socket_.is-closed: return
+    // Best-effort — see send-probe_ comment.
+    catch --trace: socket_.send packet
 
   /**
   Sends a response to a query.
   Checks QU bits in questions to determine unicast vs multicast.
+  Applies Known-Answer Suppression per RFC 6762 §7.1.
   */
   send-response_ query/dns.DecodedPacket? --source/net.SocketAddress?=null:
     unicast-answers := []
@@ -288,8 +384,11 @@ class StateManager:
     // 1. Hostname A Record
     q-host := find-question_ query hostname_
     if q-host:
-      target := q-host.unicast-ok ? unicast-answers : multicast-answers
-      target.add (dns.AResource hostname_ 120 local-ip_)
+      // RFC 6762 §7.1: Suppress if already in Known-Answer Section
+      // with TTL ≥ 50% of our real TTL.
+      if not query or not dns.has-known-answer query hostname_ dns.RECORD-A 120:
+        target := q-host.unicast-ok ? unicast-answers : multicast-answers
+        target.add (dns.AResource hostname_ 120 local-ip_)
     else if not query:
       // Announcement
       multicast-answers.add (dns.AResource hostname_ 120 local-ip_ --flush)
@@ -301,6 +400,10 @@ class StateManager:
       q-all := find-question_ query "_services._dns-sd._udp.local"
 
       if q-ptr or q-all:
+        // Known-Answer Suppression for PTR
+        if query and dns.has-known-answer query s.type-domain dns.RECORD-PTR 4500 --data=s.full-name:
+          continue.do  // Suppress this specific instance
+
         ptr-unicast := q-ptr ? q-ptr.unicast-ok : false
         all-unicast := q-all ? q-all.unicast-ok : false
         is-unicast := ptr-unicast or all-unicast
@@ -327,14 +430,25 @@ class StateManager:
     if not unicast-answers.is-empty and source:
       // For Unicast, ID matches query
       id := query ? query.id : 0
-      // RFC 6762 says ID must match.
+      // RFC 6762 §18.3: ID must match for legacy/unicast responses.
       packet := dns.create-dns-packet [] unicast-answers --id=id --is-response --is-authoritative
       socket_.send packet source
        
     // Send Multicast
     if not multicast-answers.is-empty:
-      // For Multicast, ID must be 0
-      packet := dns.create-dns-packet [] multicast-answers --id=0 --is-response --is-authoritative
+      // RFC 6762 §6: Per-record rate limiting — suppress only records
+      // already sent within the last second.
+      now := Time.monotonic-us
+      filtered := multicast-answers.filter: | rec |
+        key := "$rec.name:$rec.type"
+        last := last-multicast-times_.get key
+        not last or (now - last) >= 1_000_000
+      if filtered.is-empty: return
+      filtered.do: | rec |
+        last-multicast-times_["$rec.name:$rec.type"] = now
+
+      // For Multicast, ID must be 0 (RFC 6762 §18.1)
+      packet := dns.create-dns-packet [] filtered --id=0 --is-response --is-authoritative
       socket_.send packet // Uses default multicast target
 
   find-question_ query/dns.DecodedPacket? name/string -> dns.Question?:

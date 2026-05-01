@@ -3,9 +3,9 @@ import net
 import net.udp
 import net.modules.dns
 
-import ..src.service
-import ..lib.client
-import ..src.api.mdns_service
+import mdns.service show MdnsServiceProvider
+import mdns.client show Client
+import mdns.api.mdns_service show MdnsService
 import .e2e_param show TEST-PORT
 
 main:

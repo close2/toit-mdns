@@ -11,26 +11,29 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ ubuntu-latest, windows-latest, macos-latest ]
-        toit-version: [ v2.0.0-alpha.180, latest ]
-        include:
-          - toit-version: v2.0.0-alpha.180
-            version-name: old
-          - toit-version: latest
-            version-name: new
+        os: [ ubuntu-latest, windows-latest, macos-14 ]
 
-    name: CI - ${{ matrix.os }} - ${{ matrix.version-name }}
+    name: CI - ${{ matrix.os }}
 
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - uses: toitlang/action-setup@v1
-        with:
-          toit-version: ${{ matrix.toit-version }}
+
+      - name: Setup Multicast Route
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo ip link set lo up
+            sudo route add -net 224.0.0.0 netmask 240.0.0.0 dev lo || true
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            sudo ifconfig lo0 up
+            sudo route -n add -net 224.0.0.0/4 -interface lo0 || true
+          fi
 
       - name: Test
-        run: |
-          make test
+        run: make test

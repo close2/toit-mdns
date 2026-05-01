@@ -1,8 +1,8 @@
 import expect show *
 import net
-import ..lib.client
-import ..src.api.mdns_service
-import ..src.service
+import mdns.client show Client
+import mdns.api.mdns_service show MdnsService
+import mdns.service show MdnsServiceProvider
 import .e2e_param show TEST-PORT
 
 main:
@@ -22,8 +22,9 @@ test-hostname-conflict:
   s2.handle MdnsService.SET-HOSTNAME-INDEX "other.local" --client=2 --gid=0
   
   try:
-    // Allow initial established state
-    sleep (Duration --s=2)
+    // Allow initial established state.
+    // Probing (jitter+3×250ms) + announcing (2×1s) = ~2.5s per provider.
+    sleep (Duration --s=5)
     print "S1 Hostname: $(s1.hostname)"
     print "S2 Hostname: $(s2.hostname)"
     
@@ -35,9 +36,9 @@ test-hostname-conflict:
     // Trigger conflict by setting S2 to the same name as S1
     s2.handle MdnsService.SET-HOSTNAME-INDEX "device.local" --client=2 --gid=0
     
-    // Probing takes ~750ms total + some grace period
+    // Probing takes ~1s + announcing ~1s + extra margin.
     print "Waiting for conflict resolution..."
-    sleep (Duration --s=4)
+    sleep (Duration --s=6)
     
     print "Final S1 Hostname: $(s1.hostname)"
     print "Final S2 Hostname: $(s2.hostname)"

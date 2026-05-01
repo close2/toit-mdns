@@ -1,15 +1,5 @@
 all: test
 
-TOIT_EXEC ?= $(shell which toit 2>/dev/null)
-ifeq ($(TOIT_EXEC),)
-  JAG_EXEC := $(shell which jag 2>/dev/null)
-  ifneq ($(JAG_EXEC),)
-    TOIT_EXEC := jag toit
-  else
-    TOIT_EXEC := toit
-  endif
-endif
-
 .PHONY: build/CMakeCache.txt
 build/CMakeCache.txt:
 	$(MAKE) rebuild-cmake
@@ -22,6 +12,6 @@ test: install-pkgs rebuild-cmake
 
 rebuild-cmake:
 	mkdir -p build
-	cmake -B build -DCMAKE_BUILD_TYPE=Debug -DTOIT_EXEC="$(TOIT_EXEC)"
+	cmake -B build -DCMAKE_BUILD_TYPE=Debug
 
 .PHONY: all test rebuild-cmake install-pkgs

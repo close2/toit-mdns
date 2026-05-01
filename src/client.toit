@@ -35,8 +35,8 @@ import net.modules.dns
 import system
 import system.services show ServiceClient
 
-import ..src.api.mdns_service
-import ..src.service as service
+import .api.mdns_service
+import .service as service
 
 /**
 Primary user-facing mDNS client.
@@ -157,7 +157,7 @@ class Client:
   lifecycle based on whether any connected clients are requesting it.
   
   If the hostname is already in use by another device, the service will
-  automatically rename it (e.g., "name.local" -> "name (2).local") and
+  automatically rename it (e.g., "name.local" -> "name-2.local") and
   the effective hostname can be retrieved via $hostname.
   */
   set-hostname hostname/string:
@@ -273,7 +273,7 @@ class MdnsServiceClient extends ServiceClient implements MdnsService:
     return invoke_ MdnsService.GET-HOSTNAME-INDEX null
 
   close:
-    // Do nothing for RPC client
+    super
 
 /**
 A client that uses a local mDNS service provider.
