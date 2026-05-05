@@ -1,10 +1,12 @@
 /**
 mDNS response cache.
 
-Caches DNS resource records learned from multicast responses. This serves
-two purposes:
-1. Avoid redundant network queries for recently-seen records
-2. Enable passive learning from other devices' mDNS traffic
+Caches DNS resource records learned from multicast responses.  The
+cache is **opt-in** — records are only stored for names actively
+being looked up.  This avoids the unbounded growth that comes from
+passively absorbing every multicast packet on a busy LAN (each
+record's TTL is typically 4500 s, so passive caching is effectively
+a slow leak).
 
 # Cache Key Design
 
@@ -18,10 +20,11 @@ Each cached record carries an expiry timestamp based on its TTL. The cache
 periodically prunes expired entries. Identical records (same name, type,
 and data) have their TTL refreshed rather than creating duplicates.
 
-# Cleanup Throttling
+# Cleanup
 
-To avoid excessive CPU usage, cleanup runs at most once per second.
-Expired records are lazily removed during cache operations.
+Expired entries are pruned lazily on lookup (no background task; that
+would consume one Toit task per cleanup pass on a tiny ESP32 heap).
+The pass is throttled to once per second.
 */
 
 import net
@@ -51,27 +54,31 @@ class MdnsCache:
 
   // Cleanup throttling: Only cleanup once per second (1_000_000 microseconds)
   static CLEANUP-INTERVAL-US_ ::= 1_000_000
+  // Hard cap on the number of distinct (name,type,class) keys.  When
+  // we hit it the oldest expiring entries are dropped.  64 keys is
+  // ample for a slave-clock controller (we look up at most a handful
+  // of hostnames at a time) and keeps the worst-case cache footprint
+  // well under 4 kB.
+  static MAX-KEYS_ ::= 64
   last-cleanup-us_/int := 0
 
   add record/dns.Resource:
     key := build-key_ record.name record.type 1 // Class IN
     list := records_.get key --init=(: [])
-    
+
     now := Time.monotonic-us
     expiry := now + (record.ttl * 1_000_000)
 
-    // Check if we should update an existing entry
-    updated := false
-    list.map --in-place: | entry/CacheEntry |
+    // If an identical record is already cached, just refresh its TTL
+    // in place.  Stop scanning as soon as we find the match.
+    list.size.repeat: | i |
+      entry/CacheEntry := list[i]
       if equal_ entry.record record:
-         updated = true
-         // Update TTL
-         CacheEntry record expiry
-      else:
-        entry
-    
-    if not updated:
-      list.add (CacheEntry record expiry)
+        list[i] = CacheEntry record expiry
+        return
+
+    list.add (CacheEntry record expiry)
+    if records_.size > MAX-KEYS_: evict-one_
 
   lookup name/string type/int -> List:
     cleanup_
@@ -79,18 +86,32 @@ class MdnsCache:
     list := records_.get key --if-absent=(: return [])
     return list.map: it.record
 
-  // Remove expired records
+  // Remove expired records.  Synchronous: we run inside whatever task
+  // happened to call us.  The throttle keeps the cost amortised.
   cleanup_:
     now := Time.monotonic-us
-    // Only cleanup if enough time has passed since the last cleanup.
     if now - last-cleanup-us_ < CLEANUP-INTERVAL-US_: return
     last-cleanup-us_ = now
 
-    task::
-      records_.filter --in-place: | key list |
-        list.filter --in-place: | entry |
-          entry.expiry > now
-        not list.is-empty
+    records_.filter --in-place: | _ list |
+      list.filter --in-place: | entry/CacheEntry |
+        entry.expiry > now
+      not list.is-empty
+
+  /**
+  Drops the key whose entries expire soonest.  Called when the cache
+  exceeds $MAX-KEYS_; this is a coarse but cheap LRU-like policy that
+  prevents unbounded growth on networks with lots of mDNS chatter.
+  */
+  evict-one_ -> none:
+    earliest-key/string? := null
+    earliest-expiry/int := int.MAX
+    records_.do: | key list/List |
+      list.do: | entry/CacheEntry |
+        if entry.expiry < earliest-expiry:
+          earliest-expiry = entry.expiry
+          earliest-key = key
+    if earliest-key: records_.remove earliest-key
 
   build-key_ name/string type/int klass/int -> string:
     return "$name:$type:$klass"

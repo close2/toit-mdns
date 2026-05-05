@@ -71,28 +71,36 @@ class QueryEngine:
 
   /**
   Called from the service for every packet.
+
+  Only adds records to the cache for names we are actively looking
+  up.  Passively absorbing every multicast record visible on the
+  LAN — printers, AppleTVs, phones, etc. — would slowly bloat the
+  cache (their TTLs are typically 4500 s), and we never use those
+  records anyway.
   */
   process-packet packet/dns.DecodedPacket:
-    // Update cache with all answers
-    packet.resources.do: cache_.add it
-    packet.additionals.do: cache_.add it
-    packet.authorities.do: cache_.add it
+    // Fast path: when nothing is pending, do not allocate the
+    // names-in-packet set or scan the resource lists.
+    if pending_.is-empty: return
 
-    // Notify pending queries if we have answers for them
-    // Broad strategy: Check if packet contains answers for any pending name
-    names-in-packet := {}
-    packet.resources.do: names-in-packet.add it.name
-    packet.additionals.do: names-in-packet.add it.name
-    packet.authorities.do: names-in-packet.add it.name
-    
-    names-in-packet.do: | name |
-      listeners := pending_.get name
-      if listeners:
-        listeners.do: | query/PendingQuery_ |
-          // Check if we found what this query was looking for
-          results := search-cache_ name query.record-types
-          if not results.is-empty and not query.latch.has-value:
+    // Update cache only for resource records whose name matches a
+    // name we are currently looking up.
+    add-if-pending_ packet.resources
+    add-if-pending_ packet.additionals
+    add-if-pending_ packet.authorities
+
+    // Notify pending queries if we have answers for them.
+    pending_.do: | name listeners/List |
+      results/List? := null
+      listeners.do: | query/PendingQuery_ |
+        if not query.latch.has-value:
+          if results == null: results = search-cache_ name query.record-types
+          if not results.is-empty:
             query.latch.set results
+
+  add-if-pending_ resources/List:
+    resources.do: | res/dns.Resource |
+      if pending_.contains res.name: cache_.add res
 
 
   send-query_ name/string record-types/int:
