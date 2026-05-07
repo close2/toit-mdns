@@ -27,6 +27,31 @@ parse packet/ByteArray -> dns.DecodedPacket:
   return dns.decode-packet packet --error-name="incoming_packet"
 
 /**
+Case-insensitive comparison of DNS names per RFC 6762 §16.
+
+ASCII letters in `a..z` (0x61..0x7A) match their uppercase equivalents
+in `A..Z` (0x41..0x5A). All other bytes (including UTF-8 multi-byte
+sequences) are compared by binary equality.
+
+This is used everywhere the implementation compares DNS names, since
+`MyHost.local`, `myhost.local`, and `MYHOST.LOCAL` must all be treated
+as the same name.
+*/
+name-equals a/string b/string -> bool:
+  if identical a b: return true
+  if a.size != b.size: return false
+  size := a.size
+  for i := 0; i < size; i++:
+    ca := a.at --raw i
+    cb := b.at --raw i
+    if ca == cb: continue
+    // Lowercase ASCII letters; leave everything else as-is.
+    if 'A' <= ca <= 'Z': ca += 'a' - 'A'
+    if 'A' <= cb <= 'Z': cb += 'a' - 'A'
+    if ca != cb: return false
+  return true
+
+/**
 Validates that a decoded packet conforms to mDNS header requirements.
 
 RFC 6762 §18.3: OPCODE MUST be zero; messages with non-zero OPCODE
@@ -44,7 +69,7 @@ is-valid-mdns-message packet/dns.DecodedPacket -> bool:
 /** Checks if a packet is a query for a specific name. */
 is-query-for packet/dns.DecodedPacket name/string -> bool:
   if packet.is-response: return false
-  return packet.questions.any: it.name == name
+  return packet.questions.any: name-equals it.name name
 
 /**
 Checks if a query contains known answers that suppress our response.
@@ -67,19 +92,21 @@ has-known-answer query/dns.DecodedPacket name/string type/int our-ttl/int
     --data/string?=null
     --record/dns.Resource?=null -> bool:
   query.resources.do: | res |
-    if res.name == name and res.type == type and res.ttl >= (our-ttl / 2):
+    if (name-equals res.name name) and res.type == type and res.ttl >= (our-ttl / 2):
       if record:
         if resource-data-matches_ res record: return true
         continue.do
       if data == null: return true
       // For PTR/CNAME records, also verify the string data matches
       // our specific instance.
-      if (res is dns.StringResource) and (res as dns.StringResource).value == data:
+      if (res is dns.StringResource) and
+          name-equals (res as dns.StringResource).value data:
         return true
   return false
 
 resource-data-matches_ actual/dns.Resource expected/dns.Resource -> bool:
-  if actual.type != expected.type or actual.name != expected.name: return false
+  if actual.type != expected.type: return false
+  if not name-equals actual.name expected.name: return false
   if actual is dns.AResource and expected is dns.AResource:
     return (actual as dns.AResource).address == (expected as dns.AResource).address
   if actual is dns.SrvResource and expected is dns.SrvResource:
@@ -88,9 +115,9 @@ resource-data-matches_ actual/dns.Resource expected/dns.Resource -> bool:
     return actual-srv.priority == expected-srv.priority and
       actual-srv.weight == expected-srv.weight and
       actual-srv.port == expected-srv.port and
-      actual-srv.value == expected-srv.value
+      (name-equals actual-srv.value expected-srv.value)
   if actual is dns.StringResource and expected is dns.StringResource:
-    return (actual as dns.StringResource).value == (expected as dns.StringResource).value
+    return name-equals (actual as dns.StringResource).value (expected as dns.StringResource).value
   return false
 
 /**
@@ -104,7 +131,7 @@ is-authoritative-response-for packet/dns.DecodedPacket name/string -> bool:
   if not packet.is-response: return false
   if not packet.is-authoritative: return false
   // Check answers for the name.
-  return packet.resources.any: it.name == name
+  return packet.resources.any: name-equals it.name name
 
 /**
 Checks if a packet is a probe query for a specific name.
@@ -116,7 +143,7 @@ records in the Authority Section for tiebreaking.
 is-probe-for packet/dns.DecodedPacket name/string -> bool:
   if packet.is-response: return false
   if packet.authorities.is-empty: return false
-  return packet.questions.any: it.name == name
+  return packet.questions.any: name-equals it.name name
 
 /**
 Extracts A record addresses from the Authority Section for a given name.
@@ -127,7 +154,7 @@ Authority Section for tiebreaking comparison.
 get-authority-addresses packet/dns.DecodedPacket name/string -> List:
   result := []
   packet.authorities.do: | res |
-    if res.name == name and res is dns.AResource:
+    if (name-equals res.name name) and res is dns.AResource:
       result.add (res as dns.AResource).address
   return result
 

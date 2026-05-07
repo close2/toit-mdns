@@ -42,6 +42,9 @@ class QueryEngine:
   lookup name/string -> List
       --record-types/int
       --timeout-us/int:
+    // RFC 6762 §16: DNS names are case-insensitive. Normalize the
+    // key we use for the cache and for matching incoming responses.
+    name = name.to-ascii-lower
     // 1. Check Cache
     answers := search-cache_ name record-types
     if not answers.is-empty: return answers
@@ -108,7 +111,7 @@ class QueryEngine:
 
   contains-pending-name_ resources/List -> bool:
     resources.do: | res/dns.Resource |
-      if pending_.contains res.name: return true
+      if pending_.contains res.name.to-ascii-lower: return true
     return false
 
   add-all_ resources/List:
