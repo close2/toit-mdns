@@ -84,6 +84,13 @@ class StateManager:
   
   probe-count_ := 0
   probe-timer_/Task? := null
+  // Generation counter: bumped every time we (re)enter probing.  An
+  // in-flight probe task that loses its slot to a newer one detects this
+  // and exits without doing extra work.  Cancellation eventually fires
+  // at the task's next yield, but it doesn't preempt synchronous code,
+  // so we still need this guard to prevent stale iterations from
+  // sending probes or transitioning to ANNOUNCING.
+  probe-generation_/int := 0
   first-probe-sent_/bool := false
   stopped_/bool := false
   
@@ -135,8 +142,11 @@ class StateManager:
     instance-name := name or (hostname_.copy 0 hostname_.size - 6)
     service := RegisteredService type instance-name port txt
     services_.add service
-    if state_ != STATE-PROBING:
-      enter-probing_
+    // RFC 6762 §8: a newly added record must go through probing too.
+    // Restart the probing cycle unconditionally so the new service gets
+    // the full three probes; if we are already probing, a partially
+    // completed cycle would otherwise leave the new service under-probed.
+    enter-probing_
 
   /**
   Starts the state machine. Begins by entering the probing phase.
@@ -224,7 +234,11 @@ class StateManager:
       if is-conflict:
         if state_ == STATE-PROBING:
           handle-probing-conflict_
-        else if state_ == STATE-ESTABLISHED:
+        else if state_ == STATE-ANNOUNCING or state_ == STATE-ESTABLISHED:
+          // RFC 6762 §9: conflict resolution applies any time after
+          // probing succeeds.  ANNOUNCING is a window where ignoring a
+          // conflict would let two responders briefly believe they own
+          // the name.
           handle-established-conflict_
 
     if state_ != STATE-ANNOUNCING and state_ != STATE-ESTABLISHED: return
@@ -243,7 +257,10 @@ class StateManager:
   */
   has-relevant-question_ query/dns.DecodedPacket -> bool:
     if dns.is-query-for query hostname_: return true
-    services_.do: | s/RegisteredService |
+    // Snapshot size to be safe against concurrent register-service.
+    n := services_.size
+    n.repeat: | i |
+      s/RegisteredService := services_[i]
       if dns.is-query-for query s.full-name: return true
       if dns.is-query-for query s.type-domain: return true
     return dns.is-query-for query "_services._dns-sd._udp.local"
@@ -255,12 +272,17 @@ class StateManager:
     probe-count_ = 0
     first-probe-sent_ = false
     defend-count_ = 0 // Reset defense count
+    // Bump the generation so any in-flight probe task from a previous
+    // call exits at its next loop iteration even before its
+    // CANCELED-ERROR fires.
+    probe-generation_++
 
     if probe-timer_: probe-timer_.cancel
 
     // 2. Start the probing loop in a task.
     //    Cancellation (from $stop or a new call to $enter-probing_) fires
     //    at the next sleep, propagating through catch as CANCELED-ERROR.
+    my-generation := probe-generation_
     probe-timer_ = task::
       try:
         // RFC 6762 §8.7: After 15 conflicts in 10 seconds,
@@ -279,14 +301,22 @@ class StateManager:
         jitter-ms := random 251  // 0..250 inclusive
         sleep (Duration --ms=jitter-ms)
 
-        while state_ == STATE-PROBING and probe-count_ < 3:
+        while not stopped_
+            and probe-generation_ == my-generation
+            and state_ == STATE-PROBING
+            and probe-count_ < 3:
           probe-count_++
           first-probe-sent_ = true
           send-probe_
           sleep (Duration --ms=250)
-        
-        if state_ == STATE-PROBING:
-          enter-announcing_
+
+        // Only the most recent probe generation may transition to
+        // ANNOUNCING.  Otherwise an old, lingering task could announce
+        // for a hostname that has since been replaced.
+        if not stopped_
+            and probe-generation_ == my-generation
+            and state_ == STATE-PROBING:
+          enter-announcing_ my-generation
       finally:
         // If enter-probing_ was called again (e.g. because of a rename),
         // it cancelled this task and started a new one (updating probe-timer_).
@@ -322,19 +352,24 @@ class StateManager:
       hostname_ = new-name
       enter-probing_
 
-  enter-announcing_:
+  enter-announcing_ generation/int:
     state_ = STATE-ANNOUNCING
     // RFC 6762 §8.3: "The Multicast DNS responder MUST send at least
     //  two unsolicited responses, one second apart."
     send-announcement_
     sleep (Duration --s=1)
-    // Only send the second announcement if we haven't been moved
-    // back to probing (e.g. by a conflict during the 1s wait).
+    // Only send the second announcement if we are still the active
+    // probe generation and have not been moved back to probing (e.g.
+    // by a conflict during the 1s wait).
+    if probe-generation_ != generation: return
     if state_ == STATE-ANNOUNCING:
       send-announcement_
-    // Transition to established
-    state_ = STATE-ESTABLISHED
-    log.info "Service established" --tags={"hostname": hostname_, "ip": local-ip_}
+    // Transition to established only if no conflict moved us back to
+    // probing during the announcement window.  Without this guard, a
+    // conflict during the sleep above could be silently overwritten.
+    if probe-generation_ == generation and state_ == STATE-ANNOUNCING:
+      state_ = STATE-ESTABLISHED
+      log.info "Service established" --tags={"hostname": hostname_, "ip": local-ip_}
 
   send-probe_:
     questions := [dns.Question hostname_ dns.RECORD-ANY]
@@ -403,8 +438,13 @@ class StateManager:
       // Announcement
       multicast-answers.add (dns.AResource hostname_ 120 local-ip_ --flush)
 
-    // 2. Services
-    services_.do: | s/RegisteredService |
+    // 2. Services. Snapshot the size up front: if another task adds
+    // a service while we are iterating (and we yield in socket_.send),
+    // we must not start answering for an unprobed service from the
+    // current packet.
+    services-snapshot-size := services_.size
+    services-snapshot-size.repeat: | i |
+      s/RegisteredService := services_[i]
       // PTR for the type-domain (e.g. "_http._tcp.local" -> instance).
       q-ptr := find-question_ query s.type-domain dns.RECORD-PTR
       // Meta-query PTR (RFC 6763 §9): "_services._dns-sd._udp.local"
@@ -470,8 +510,12 @@ class StateManager:
       questions := legacy-query and query ? query.questions : []
       // RFC 6762 §18.3: ID must match for legacy/unicast responses.
       packet := dns.create-dns-packet questions unicast-answers --id=id --is-response --is-authoritative
-      socket_.send packet source
-       
+      // Best-effort: on some platforms (e.g. macOS) sendto() to a
+      // querier whose address we cannot route to fails with
+      // NOT_CONNECTED / NO_ROUTE.  The protocol recovers because the
+      // querier will repeat its query.
+      catch --trace: socket_.send packet source
+
     // Send Multicast
     if not multicast-answers.is-empty:
       // RFC 6762 §6: Per-record rate limiting — suppress only records
@@ -487,7 +531,8 @@ class StateManager:
 
       // For Multicast, ID must be 0 (RFC 6762 §18.1)
       packet := dns.create-dns-packet [] filtered --id=0 --is-response --is-authoritative
-      socket_.send packet // Uses default multicast target
+      // Best-effort multicast send — see send-probe_ for rationale.
+      catch --trace: socket_.send packet // Uses default multicast target
 
   find-question_ query/dns.DecodedPacket? name/string type/int -> dns.Question?:
     if not query: return null

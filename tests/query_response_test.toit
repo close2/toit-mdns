@@ -92,7 +92,15 @@ test-legacy-query-uses-unicast-response:
     receiver := network.udp-open --port=0
     try:
       query := dns.create-dns-packet [dns.Question "legacy.local" dns.RECORD-A] [] --id=0x4242 --is-response=false
-      sm.process-packet (dns-helper.parse query) --source=receiver.local-address
+      // The receiver socket may have bound to INADDR_ANY (0.0.0.0) on
+      // macOS, in which case sending unicast to that address fails with
+      // "No route to host".  Use the network's actual local IP combined
+      // with the receiver's randomly assigned port so the unicast send
+      // is routable on every platform we support.
+      source-address := net.SocketAddress
+          network.address
+          receiver.local-address.port
+      sm.process-packet (dns-helper.parse query) --source=source-address
 
       response := wait-for-unicast-response receiver "legacy.local"
       expect-not-null response
