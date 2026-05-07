@@ -63,14 +63,34 @@ The optional $data parameter, when provided, additionally matches
 Returns true if the query's Known-Answer Section already contains
   a matching record with ≥ 50% of our TTL, meaning we should suppress.
 */
-has-known-answer query/dns.DecodedPacket name/string type/int our-ttl/int --data/string?=null -> bool:
+has-known-answer query/dns.DecodedPacket name/string type/int our-ttl/int
+    --data/string?=null
+    --record/dns.Resource?=null -> bool:
   query.resources.do: | res |
     if res.name == name and res.type == type and res.ttl >= (our-ttl / 2):
+      if record:
+        if resource-data-matches_ res record: return true
+        continue.do
       if data == null: return true
       // For PTR/CNAME records, also verify the string data matches
       // our specific instance.
       if (res is dns.StringResource) and (res as dns.StringResource).value == data:
         return true
+  return false
+
+resource-data-matches_ actual/dns.Resource expected/dns.Resource -> bool:
+  if actual.type != expected.type or actual.name != expected.name: return false
+  if actual is dns.AResource and expected is dns.AResource:
+    return (actual as dns.AResource).address == (expected as dns.AResource).address
+  if actual is dns.SrvResource and expected is dns.SrvResource:
+    actual-srv := actual as dns.SrvResource
+    expected-srv := expected as dns.SrvResource
+    return actual-srv.priority == expected-srv.priority and
+      actual-srv.weight == expected-srv.weight and
+      actual-srv.port == expected-srv.port and
+      actual-srv.value == expected-srv.value
+  if actual is dns.StringResource and expected is dns.StringResource:
+    return (actual as dns.StringResource).value == (expected as dns.StringResource).value
   return false
 
 /**

@@ -83,11 +83,14 @@ class QueryEngine:
     // names-in-packet set or scan the resource lists.
     if pending_.is-empty: return
 
-    // Update cache only for resource records whose name matches a
-    // name we are currently looking up.
-    add-if-pending_ packet.resources
-    add-if-pending_ packet.additionals
-    add-if-pending_ packet.authorities
+    // If a packet contains a record for a name we are actively
+    // looking up, keep the whole packet. DNS-SD responses commonly
+    // include useful SRV/TXT/A additionals whose names differ from the
+    // primary PTR question.
+    if is-relevant-packet_ packet:
+      add-all_ packet.resources
+      add-all_ packet.additionals
+      add-all_ packet.authorities
 
     // Notify pending queries if we have answers for them.
     pending_.do: | name listeners/List |
@@ -98,25 +101,38 @@ class QueryEngine:
           if not results.is-empty:
             query.latch.set results
 
-  add-if-pending_ resources/List:
+  is-relevant-packet_ packet/dns.DecodedPacket -> bool:
+    return contains-pending-name_ packet.resources or
+      contains-pending-name_ packet.additionals or
+      contains-pending-name_ packet.authorities
+
+  contains-pending-name_ resources/List -> bool:
     resources.do: | res/dns.Resource |
-      if pending_.contains res.name: cache_.add res
+      if pending_.contains res.name: return true
+    return false
+
+  add-all_ resources/List:
+    resources.do: | res/dns.Resource |
+      cache_.add res
 
 
   send-query_ name/string record-types/int:
     questions := []
     // Expand record-types bitmask to Questions
     // Common types
+    // Prefer normal multicast replies. In local multi-client scenarios
+    // all mDNS sockets share the same UDP port with reuse-port, so QU
+    // replies can be delivered to the wrong socket and make lookups flaky.
     if record-types & dns.RECORD-A != 0:
-      questions.add (dns.Question name dns.RECORD-A --unicast-ok)
+      questions.add (dns.Question name dns.RECORD-A)
     if record-types & dns.RECORD-AAAA != 0:
-      questions.add (dns.Question name dns.RECORD-AAAA --unicast-ok)
+      questions.add (dns.Question name dns.RECORD-AAAA)
     if record-types & dns.RECORD-TXT != 0:
-      questions.add (dns.Question name dns.RECORD-TXT --unicast-ok)
+      questions.add (dns.Question name dns.RECORD-TXT)
     if record-types & dns.RECORD-SRV != 0:
-      questions.add (dns.Question name dns.RECORD-SRV --unicast-ok)
+      questions.add (dns.Question name dns.RECORD-SRV)
     if record-types & dns.RECORD-PTR != 0:
-      questions.add (dns.Question name dns.RECORD-PTR --unicast-ok)
+      questions.add (dns.Question name dns.RECORD-PTR)
       
     if questions.is-empty: return
 

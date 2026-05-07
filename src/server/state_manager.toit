@@ -227,7 +227,7 @@ class StateManager:
         else if state_ == STATE-ESTABLISHED:
           handle-established-conflict_
 
-    if state_ != STATE-ESTABLISHED: return
+    if state_ != STATE-ANNOUNCING and state_ != STATE-ESTABLISHED: return
 
     if dns.is-query-for decoded hostname_:
       // Respond to query
@@ -380,15 +380,19 @@ class StateManager:
   send-response_ query/dns.DecodedPacket? --source/net.SocketAddress?=null:
     unicast-answers := []
     multicast-answers := []
+    legacy-query := source and source.port != expected-port_
     
     // 1. Hostname A Record
-    q-host := find-question_ query hostname_
+    q-host := find-question_ query hostname_ dns.RECORD-A
     if q-host:
+      host-answer := legacy-query
+          ? dns.AResource hostname_ 10 local-ip_
+          : dns.AResource hostname_ 120 local-ip_ --flush
       // RFC 6762 §7.1: Suppress if already in Known-Answer Section
       // with TTL ≥ 50% of our real TTL.
-      if not query or not dns.has-known-answer query hostname_ dns.RECORD-A 120:
-        target := q-host.unicast-ok ? unicast-answers : multicast-answers
-        target.add (dns.AResource hostname_ 120 local-ip_)
+      if not query or not dns.has-known-answer query hostname_ dns.RECORD-A 120 --record=host-answer:
+        target := legacy-query or q-host.unicast-ok ? unicast-answers : multicast-answers
+        target.add host-answer
     else if not query:
       // Announcement
       multicast-answers.add (dns.AResource hostname_ 120 local-ip_ --flush)
@@ -396,42 +400,59 @@ class StateManager:
     // 2. Services
     services_.do: | s/RegisteredService |
       // PTR
-      q-ptr := find-question_ query s.type-domain
-      q-all := find-question_ query "_services._dns-sd._udp.local"
+      q-ptr := find-question_ query s.type-domain dns.RECORD-PTR
+      q-all := find-question_ query "_services._dns-sd._udp.local" dns.RECORD-PTR
 
       if q-ptr or q-all:
+        ptr-answer := dns.StringResource s.type-domain dns.RECORD-PTR
+            (legacy-query ? 10 : 4500)
+            false
+            s.full-name
+        srv-ttl := legacy-query ? 10 : 120
+        srv-flush := not legacy-query
+        txt-ttl := legacy-query ? 10 : 4500
+        host-ttl := legacy-query ? 10 : 120
         // Known-Answer Suppression for PTR
-        if query and dns.has-known-answer query s.type-domain dns.RECORD-PTR 4500 --data=s.full-name:
+        if query and dns.has-known-answer query s.type-domain dns.RECORD-PTR 4500 --record=ptr-answer:
           continue.do  // Suppress this specific instance
 
         ptr-unicast := q-ptr ? q-ptr.unicast-ok : false
         all-unicast := q-all ? q-all.unicast-ok : false
-        is-unicast := ptr-unicast or all-unicast
+        is-unicast := legacy-query or ptr-unicast or all-unicast
 
         target := is-unicast ? unicast-answers : multicast-answers
-        target.add (dns.StringResource s.type-domain dns.RECORD-PTR 4500 false s.full-name)
+        target.add ptr-answer
 
         // Additionals
-        target.add (dns.SrvResource s.full-name dns.RECORD-SRV 120 true hostname_ 0 0 s.port)
+        target.add (dns.SrvResource s.full-name dns.RECORD-SRV srv-ttl srv-flush hostname_ 0 0 s.port)
         txt-list := build-txt-list_ s.txt
-        target.add (dns.TxtResource s.full-name 4500 true txt-list)
-        target.add (dns.AResource hostname_ 120 local-ip_)
+        target.add (dns.TxtResource s.full-name txt-ttl srv-flush txt-list)
+        target.add (dns.AResource hostname_ host-ttl local-ip_)
 
       // SRV/TXT direct query
-      q-srv := find-question_ query s.full-name
-      if q-srv:
-        target := q-srv.unicast-ok ? unicast-answers : multicast-answers
-        target.add (dns.SrvResource s.full-name dns.RECORD-SRV 120 true hostname_ 0 0 s.port)
+      q-srv := find-question_ query s.full-name dns.RECORD-SRV
+      q-txt := find-question_ query s.full-name dns.RECORD-TXT
+      if q-srv or q-txt:
+        is-unicast := legacy-query or (q-srv and q-srv.unicast-ok) or (q-txt and q-txt.unicast-ok)
+        srv-ttl := legacy-query ? 10 : 120
+        srv-flush := not legacy-query
+        txt-ttl := legacy-query ? 10 : 4500
+        host-ttl := legacy-query ? 10 : 120
+        target := is-unicast ? unicast-answers : multicast-answers
+        if q-srv:
+          target.add (dns.SrvResource s.full-name dns.RECORD-SRV srv-ttl srv-flush hostname_ 0 0 s.port)
         txt-list := build-txt-list_ s.txt
-        target.add (dns.TxtResource s.full-name 4500 true txt-list)
-        target.add (dns.AResource hostname_ 120 local-ip_)
+        if q-txt:
+          target.add (dns.TxtResource s.full-name txt-ttl srv-flush txt-list)
+        target.add (dns.AResource hostname_ host-ttl local-ip_)
 
     // Send Unicast
     if not unicast-answers.is-empty and source:
       // For Unicast, ID matches query
       id := query ? query.id : 0
+      questions := legacy-query and query ? query.questions : []
       // RFC 6762 §18.3: ID must match for legacy/unicast responses.
-      packet := dns.create-dns-packet [] unicast-answers --id=id --is-response --is-authoritative
+      packet := dns.create-dns-packet questions unicast-answers --id=id --is-response --is-authoritative
       socket_.send packet source
        
     // Send Multicast
@@ -451,10 +472,10 @@ class StateManager:
       packet := dns.create-dns-packet [] filtered --id=0 --is-response --is-authoritative
       socket_.send packet // Uses default multicast target
 
-  find-question_ query/dns.DecodedPacket? name/string -> dns.Question?:
+  find-question_ query/dns.DecodedPacket? name/string type/int -> dns.Question?:
     if not query: return null
     query.questions.do: | q |
-       if q.name == name: return q
+       if q.name == name and (q.type == type or q.type == dns.RECORD-ANY): return q
     return null
 
   hostname -> string:
