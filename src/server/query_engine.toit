@@ -42,6 +42,9 @@ class QueryEngine:
   lookup name/string -> List
       --record-types/int
       --timeout-us/int:
+    // RFC 6762 §16: DNS names are case-insensitive. Normalize the
+    // key we use for the cache and for matching incoming responses.
+    name = name.to-ascii-lower
     // 1. Check Cache
     answers := search-cache_ name record-types
     if not answers.is-empty: return answers
@@ -71,44 +74,68 @@ class QueryEngine:
 
   /**
   Called from the service for every packet.
+
+  Only adds records to the cache for names we are actively looking
+  up.  Passively absorbing every multicast record visible on the
+  LAN — printers, AppleTVs, phones, etc. — would slowly bloat the
+  cache (their TTLs are typically 4500 s), and we never use those
+  records anyway.
   */
   process-packet packet/dns.DecodedPacket:
-    // Update cache with all answers
-    packet.resources.do: cache_.add it
-    packet.additionals.do: cache_.add it
-    packet.authorities.do: cache_.add it
+    // Fast path: when nothing is pending, do not allocate the
+    // names-in-packet set or scan the resource lists.
+    if pending_.is-empty: return
 
-    // Notify pending queries if we have answers for them
-    // Broad strategy: Check if packet contains answers for any pending name
-    names-in-packet := {}
-    packet.resources.do: names-in-packet.add it.name
-    packet.additionals.do: names-in-packet.add it.name
-    packet.authorities.do: names-in-packet.add it.name
-    
-    names-in-packet.do: | name |
-      listeners := pending_.get name
-      if listeners:
-        listeners.do: | query/PendingQuery_ |
-          // Check if we found what this query was looking for
-          results := search-cache_ name query.record-types
-          if not results.is-empty and not query.latch.has-value:
+    // If a packet contains a record for a name we are actively
+    // looking up, keep the whole packet. DNS-SD responses commonly
+    // include useful SRV/TXT/A additionals whose names differ from the
+    // primary PTR question.
+    if is-relevant-packet_ packet:
+      add-all_ packet.resources
+      add-all_ packet.additionals
+      add-all_ packet.authorities
+
+    // Notify pending queries if we have answers for them.
+    pending_.do: | name listeners/List |
+      results/List? := null
+      listeners.do: | query/PendingQuery_ |
+        if not query.latch.has-value:
+          if results == null: results = search-cache_ name query.record-types
+          if not results.is-empty:
             query.latch.set results
+
+  is-relevant-packet_ packet/dns.DecodedPacket -> bool:
+    return contains-pending-name_ packet.resources or
+      contains-pending-name_ packet.additionals or
+      contains-pending-name_ packet.authorities
+
+  contains-pending-name_ resources/List -> bool:
+    resources.do: | res/dns.Resource |
+      if pending_.contains res.name.to-ascii-lower: return true
+    return false
+
+  add-all_ resources/List:
+    resources.do: | res/dns.Resource |
+      cache_.add res
 
 
   send-query_ name/string record-types/int:
     questions := []
     // Expand record-types bitmask to Questions
     // Common types
+    // Prefer normal multicast replies. In local multi-client scenarios
+    // all mDNS sockets share the same UDP port with reuse-port, so QU
+    // replies can be delivered to the wrong socket and make lookups flaky.
     if record-types & dns.RECORD-A != 0:
-      questions.add (dns.Question name dns.RECORD-A --unicast-ok)
+      questions.add (dns.Question name dns.RECORD-A)
     if record-types & dns.RECORD-AAAA != 0:
-      questions.add (dns.Question name dns.RECORD-AAAA --unicast-ok)
+      questions.add (dns.Question name dns.RECORD-AAAA)
     if record-types & dns.RECORD-TXT != 0:
-      questions.add (dns.Question name dns.RECORD-TXT --unicast-ok)
+      questions.add (dns.Question name dns.RECORD-TXT)
     if record-types & dns.RECORD-SRV != 0:
-      questions.add (dns.Question name dns.RECORD-SRV --unicast-ok)
+      questions.add (dns.Question name dns.RECORD-SRV)
     if record-types & dns.RECORD-PTR != 0:
-      questions.add (dns.Question name dns.RECORD-PTR --unicast-ok)
+      questions.add (dns.Question name dns.RECORD-PTR)
       
     if questions.is-empty: return
 
