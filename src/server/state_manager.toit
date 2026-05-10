@@ -114,6 +114,12 @@ class StateManager:
   services_/List := [] // List<RegisteredService>
 
   /**
+  Number of registered services.  Exposed for tests.
+  */
+  services-count -> int:
+    return services_.size
+
+  /**
   Creates a new StateManager.
   The [hostname] must end with ".local".
   The [expected-port] defaults to 5353 per RFC 6762 §6.10.
@@ -138,15 +144,35 @@ class StateManager:
   register-service type/string port/int -> none
       --txt/Map?=null
       --name/string?=null:
-    // Default name to hostname (without .local) if null
+    // Default name to hostname (without .local) if null.
     instance-name := name or (hostname_.copy 0 hostname_.size - 6)
-    service := RegisteredService type instance-name port txt
-    services_.add service
+    // Dedup: a client that re-registers the same (type, instance-name)
+    // tuple — for example after a WiFi reconnect — must not produce a
+    // duplicate entry in $services_.  Replace the existing entry in
+    // place if any of its mutable fields changed; otherwise treat the
+    // call as a no-op so we don't restart the probing cycle for free.
+    services_.size.repeat: | i |
+      existing/RegisteredService := services_[i]
+      if existing.type == type and existing.instance-name == instance-name:
+        if existing.port == port and (txt-equals_ existing.txt txt): return
+        services_[i] = RegisteredService type instance-name port txt
+        enter-probing_
+        return
+    services_.add (RegisteredService type instance-name port txt)
     // RFC 6762 §8: a newly added record must go through probing too.
     // Restart the probing cycle unconditionally so the new service gets
     // the full three probes; if we are already probing, a partially
     // completed cycle would otherwise leave the new service under-probed.
     enter-probing_
+
+  static txt-equals_ a/Map? b/Map? -> bool:
+    if identical a b: return true
+    if a == null or b == null: return false
+    if a.size != b.size: return false
+    a.do: | key value |
+      if not b.contains key: return false
+      if b[key] != value: return false
+    return true
 
   /**
   Starts the state machine. Begins by entering the probing phase.

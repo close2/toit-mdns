@@ -20,6 +20,7 @@ main:
   test-send-response-tolerates-unroutable-source
   test-register-service-during-probing-restarts
   test-rapid-reprobe-does-not-leak-old-task
+  test-register-service-is-idempotent
 
 test-send-response-tolerates-unroutable-source:
   // Bug: send-response_ called socket_.send without a catch wrapper,
@@ -127,6 +128,55 @@ test-rapid-reprobe-does-not-leak-old-task:
       sleep (Duration --ms=50)
     expect-equals StateManager.STATE-ESTABLISHED sm.state_
     expect-equals "rapid-reprobe-4.local" sm.hostname
+    print "  PASS"
+  finally:
+    sm.stop
+    socket.close
+
+test-register-service-is-idempotent:
+  // Bug: register-service unconditionally appended to services_ and
+  // restarted probing.  A client that re-registers the same service
+  // (typical after a WiFi reconnect) caused the service list to grow
+  // without bound and triggered a probing storm.  Fix: dedup by
+  // (type, instance-name) and only re-enter probing when the entry
+  // actually changes.
+  print "Test: register-service is idempotent for identical (type, name)..."
+  network := net.open
+  socket := MdnsSocket --network=network --port=TEST-PORT
+  cm := ConflictManager
+  local-ip := net.IpAddress.parse "192.168.1.50"
+  sm := StateManager socket cm "idem.local" local-ip --expected-port=TEST-PORT
+  sm.start
+  try:
+    deadline := Time.monotonic-us + 5_000_000
+    while sm.state_ != StateManager.STATE-ESTABLISHED and Time.monotonic-us < deadline:
+      sleep (Duration --ms=50)
+    expect-equals StateManager.STATE-ESTABLISHED sm.state_
+
+    sm.register-service "_http._tcp" 80 --name="App" --txt={"path": "/"}
+    expect-equals 1 sm.services-count
+    // Probing was triggered for the new service.
+    deadline = Time.monotonic-us + 5_000_000
+    while sm.state_ != StateManager.STATE-ESTABLISHED and Time.monotonic-us < deadline:
+      sleep (Duration --ms=50)
+    expect-equals StateManager.STATE-ESTABLISHED sm.state_
+    generation-after-first := sm.probe-generation_
+
+    // Re-registering the exact same service is a no-op.
+    sm.register-service "_http._tcp" 80 --name="App" --txt={"path": "/"}
+    expect-equals 1 sm.services-count
+    expect (sm.probe-generation_ == generation-after-first)
+        --message="identical re-register must not bump probe-generation"
+
+    // Changing the port replaces the entry and re-probes.
+    sm.register-service "_http._tcp" 8080 --name="App" --txt={"path": "/"}
+    expect-equals 1 sm.services-count
+    expect sm.probe-generation_ > generation-after-first
+        --message="changed port must restart probing"
+
+    // A different instance-name adds a new entry.
+    sm.register-service "_http._tcp" 80 --name="Other"
+    expect-equals 2 sm.services-count
     print "  PASS"
   finally:
     sm.stop
