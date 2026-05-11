@@ -267,6 +267,44 @@ class StateManager:
           // the name.
           handle-established-conflict_
 
+    // --- Service-instance conflict detection (RFC 6762 §8 / §9). ---
+    // Hostnames are unique per device, but two devices that pick the
+    // same DNS-SD service instance name (e.g. "Nebenuhr._http._tcp.local")
+    // would both register conflicting SRV/TXT records. RFC 6762 §8.1
+    // requires probing for *every* unique record; §9 requires conflict
+    // defense or rename for those records throughout the lifetime of
+    // the responder. We mirror the hostname logic for each service.
+    services_.size.repeat: | i |
+      s/RegisteredService := services_[i]
+      if state_ == STATE-PROBING and dns.is-probe-for decoded s.full-name:
+        // Tiebreak using the SRV target (our hostname vs theirs).  Two
+        // probers with the same instance name necessarily have
+        // different hostnames after hostname-conflict resolution, so
+        // a lexicographic comparison of the SRV target deterministically
+        // chooses one winner (avoids the symmetric-defer livelock that
+        // would arise from blindly renaming on every probe collision).
+        their-targets := get-authority-srv-targets_ decoded s.full-name
+        if not their-targets.is-empty:
+          we-lose := their-targets.any: | their-target/string |
+            (compare-names_ hostname_ their-target) < 0
+          if we-lose:
+            log.info "Service-instance probe lost, renaming"
+                --tags={"service": s.full-name}
+            handle-service-conflict_ i
+            return
+      if dns.is-authoritative-response-for decoded s.full-name:
+        is-srv-conflict := false
+        decoded.resources.do: | res |
+          if (dns.name-equals res.name s.full-name) and res is dns.SrvResource:
+            target := (res as dns.SrvResource).value
+            if not (dns.name-equals target hostname_):
+              is-srv-conflict = true
+        if is-srv-conflict:
+          log.warn "Service-instance conflict, renaming"
+              --tags={"service": s.full-name}
+          handle-service-conflict_ i
+          return
+
     if state_ != STATE-ANNOUNCING and state_ != STATE-ESTABLISHED: return
 
     // RFC 6762: a single query packet may contain multiple questions
@@ -378,6 +416,44 @@ class StateManager:
       hostname_ = new-name
       enter-probing_
 
+  /**
+  Renames the service at index $i in $services_ via $conflict-manager_
+  and re-enters probing so the new name is verified before being
+  announced.  Used for service-instance conflicts (RFC 6762 §8 / §9).
+  */
+  handle-service-conflict_ i/int -> none:
+    s/RegisteredService := services_[i]
+    new-instance := conflict-manager_.resolve-probing-conflict s.instance-name
+    services_[i] = RegisteredService s.type new-instance s.port s.txt
+    log.warn "Service-instance renamed"
+        --tags={"old": s.instance-name, "new": new-instance}
+    enter-probing_
+
+  /**
+  Returns the SRV target hostnames proposed in the probe's Authority
+  Section for a given service instance name.
+  */
+  get-authority-srv-targets_ packet/dns.DecodedPacket name/string -> List:
+    result := []
+    packet.authorities.do: | res |
+      if (dns.name-equals res.name name) and res is dns.SrvResource:
+        result.add (res as dns.SrvResource).value
+    return result
+
+  /**
+  Compares two DNS names lexicographically as binary strings (case
+  insensitive — RFC 6762 §3 case folding).  Returns positive if $a
+  wins, negative if $b wins, zero if equal.
+  */
+  static compare-names_ a/string b/string -> int:
+    al := a.to-ascii-lower
+    bl := b.to-ascii-lower
+    n := min al.size bl.size
+    n.repeat: | i |
+      diff := al[i] - bl[i]
+      if diff != 0: return diff
+    return al.size - bl.size
+
   enter-announcing_ generation/int:
     state_ = STATE-ANNOUNCING
     // RFC 6762 §8.3: "The Multicast DNS responder MUST send at least
@@ -403,9 +479,13 @@ class StateManager:
     services_.do: | s/RegisteredService |
       questions.add (dns.Question s.full-name dns.RECORD-ANY)
 
-    // RFC 6762 Section 8.2: Include our proposed A record in the
-    // Authority Section so other probers can do tiebreaking.
+    // RFC 6762 §8.2: Include all proposed unique records in the
+    // Authority Section so other simultaneously-probing devices can do
+    // tiebreaking on each name independently. We include the hostname's
+    // A record and an SRV record per registered service instance.
     authorities := [dns.AResource hostname_ 120 local-ip_]
+    services_.do: | s/RegisteredService |
+      authorities.add (dns.SrvResource s.full-name dns.RECORD-SRV 120 false hostname_ 0 0 s.port)
 
     answers := []
     packet := dns.create-dns-packet questions answers

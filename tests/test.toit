@@ -10,6 +10,7 @@ import .query_engine_wakeup_test as query_engine_wakeup_test
 import .rfc_compliance_test as rfc_compliance_test
 import .rpc_test as rpc_test
 import .service_discovery_test as service_discovery_test
+import .service_conflict_test as service_conflict_test
 
 main:
   print "RUNNING ALL TESTS..."
@@ -49,5 +50,8 @@ main:
   
   print "\n--- service_discovery_test ---"
   service_discovery_test.main
-  
+
+  print "\n--- service_conflict_test ---"
+  service_conflict_test.main
+
   print "\nALL TESTS PASSED"
