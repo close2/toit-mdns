@@ -11,6 +11,7 @@ import .rfc_compliance_test as rfc_compliance_test
 import .rpc_test as rpc_test
 import .service_discovery_test as service_discovery_test
 import .service_conflict_test as service_conflict_test
+import .lenient_parser_test as lenient_parser_test
 
 main:
   print "RUNNING ALL TESTS..."
@@ -53,5 +54,8 @@ main:
 
   print "\n--- service_conflict_test ---"
   service_conflict_test.main
+
+  print "\n--- lenient_parser_test ---"
+  lenient_parser_test.main
 
   print "\nALL TESTS PASSED"

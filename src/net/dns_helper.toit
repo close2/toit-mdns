@@ -19,12 +19,107 @@ The host with lexicographically later rdata wins. The loser defers
 by waiting one second, then re-probes.
 */
 
+import io
 import net
 import net.modules.dns
 
-/** Decodes a raw packet into a DecodedPacket (from SDK). */
+/**
+Decodes a raw packet into a $dns.DecodedPacket.
+
+Uses a lenient mDNS decoder that tolerates records whose CLASS is
+not IN. Such records (OPT pseudo-records that carry a UDP payload
+size in the class field, IXFR/AXFR variants, etc.) are silently
+skipped instead of failing the whole packet, which would otherwise
+hide legitimate IN-class records — including the very conflict
+responses we rely on for hostname defense.
+*/
 parse packet/ByteArray -> dns.DecodedPacket:
-  return dns.decode-packet packet --error-name="incoming_packet"
+  reader := io.Reader packet
+  received-id    := reader.big-endian.read-uint16
+  status-bits    := reader.big-endian.read-uint16
+  queries        := reader.big-endian.read-uint16
+  response-count := reader.big-endian.read-uint16
+  auth-count     := reader.big-endian.read-uint16
+  add-count      := reader.big-endian.read-uint16
+
+  result := dns.DecodedPacket --id=received-id --status-bits=status-bits
+
+  queries.repeat:
+    question := decode-question_ reader packet
+    if question: result.questions.add question
+
+  response-count.repeat:
+    resource := decode-resource_ reader packet
+    if resource: result.resources.add resource
+
+  auth-count.repeat:
+    resource := decode-resource_ reader packet
+    if resource: result.authorities.add resource
+
+  add-count.repeat:
+    resource := decode-resource_ reader packet
+    if resource: result.additionals.add resource
+
+  return result
+
+decode-question_ reader/io.Reader packet/ByteArray -> dns.Question?:
+  q-name := dns.decode-name reader packet
+  q-type := reader.big-endian.read-uint16
+  q-class := reader.big-endian.read-uint16
+  unicast-ok := q-class & 0x8000 != 0
+  // mDNS uses CLASS-ANY (255) for cache-flush queries and OPT-style
+  // questions can have non-IN class. Skip unsupported classes
+  // silently instead of throwing.
+  if q-class & 0x7fff != dns.CLASS-INTERNET and q-class & 0x7fff != 0xff:
+    return null
+  return dns.Question q-name q-type --unicast-ok=unicast-ok
+
+decode-resource_ reader/io.Reader packet/ByteArray -> dns.Resource?:
+  r-name := dns.decode-name reader packet
+  type := reader.big-endian.read-uint16
+  clas := reader.big-endian.read-uint16
+  ttl := reader.big-endian.read-int32
+  rd-length := reader.big-endian.read-uint16
+
+  flush := clas & 0x8000 != 0
+  // Skip records with unexpected class (e.g. OPT records carry
+  // requestor's UDP payload size in the class field). The rest of
+  // the packet must still parse.
+  if clas & 0x7fff != dns.CLASS-INTERNET:
+    reader.skip rd-length
+    return null
+
+  read-before := reader.processed
+  result/dns.Resource? := null
+  if type == dns.RECORD-A or type == dns.RECORD-AAAA:
+    length := type == dns.RECORD-A ? 4 : 16
+    if rd-length == length:
+      result = dns.AResource r-name type ttl flush
+          net.IpAddress (reader.read-bytes length)
+  else if type == dns.RECORD-PTR or type == dns.RECORD-CNAME:
+    result = dns.StringResource r-name type ttl flush
+        dns.decode-name reader packet
+  else if type == dns.RECORD-TXT:
+    value := ""
+    if rd-length > 0:
+      length := reader.read-byte
+      if rd-length >= length + 1:
+        value = reader.read-string length
+    result = dns.StringResource r-name type ttl flush value
+  else if type == dns.RECORD-SRV:
+    priority := reader.big-endian.read-uint16
+    weight := reader.big-endian.read-uint16
+    port := reader.big-endian.read-uint16
+    value := dns.decode-name reader packet
+    result = dns.SrvResource r-name type ttl flush value priority weight port
+
+  read-after := reader.processed
+  to-skip := rd-length - (read-after - read-before)
+  if to-skip < 0:
+    // Record reader over-consumed; corrupt record. Skip rest of packet.
+    return null
+  reader.skip to-skip
+  return result
 
 /**
 Case-insensitive comparison of DNS names per RFC 6762 §16.
