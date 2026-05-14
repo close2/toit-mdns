@@ -635,10 +635,28 @@ class StateManager:
       filtered.do: | rec |
         last-multicast-times_["$rec.name:$rec.type"] = now
 
+      // Prune entries older than the rate-limiting window so the map
+      // does not grow unboundedly as records come and go (renames,
+      // service churn, transient cache responses).  Bounding the
+      // table also keeps the hot path's hash lookups cheap.
+      prune-last-multicast-times_ now
+
       // For Multicast, ID must be 0 (RFC 6762 §18.1)
       packet := dns.create-dns-packet [] filtered --id=0 --is-response --is-authoritative
       // Best-effort multicast send — see send-probe_ for rationale.
       catch --trace: socket_.send packet // Uses default multicast target
+
+  // Entries older than this are no longer needed: the rate-limit
+  // window has elapsed, so a fresh "last sent" timestamp would not
+  // suppress the next multicast anyway.  Pruning is O(n) and runs
+  // only after a successful multicast — bounded by mDNS traffic.
+  static MULTICAST-RATE-LIMIT-WINDOW-US_ ::= 1_000_000
+
+  prune-last-multicast-times_ now/int -> none:
+    stale := []
+    last-multicast-times_.do: | key timestamp |
+      if now - timestamp >= MULTICAST-RATE-LIMIT-WINDOW-US_: stale.add key
+    stale.do: last-multicast-times_.remove it
 
   find-question_ query/dns.DecodedPacket? name/string type/int -> dns.Question?:
     if not query: return null

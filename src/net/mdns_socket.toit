@@ -27,8 +27,21 @@ UDP socket configured for mDNS multicast communication.
 
 Automatically joins the multicast group and caches the target address
 for efficient sending.
+
+# Network reference retention
+
+The network passed to the constructor is stored on the instance and
+kept alive for the lifetime of the socket.  This is critical: the
+Toit network proxy registers a finalizer that closes the proxy on
+garbage collection, which decrements the network service's reference
+count.  If our mDNS service is the last holder, GC of the network
+reference causes the WiFi module to shut down — manifesting as a
+silent `WIFI_DISCONNECTED` event and an unrecoverable wedge of any
+other tasks using the same interface.  We therefore retain the
+reference explicitly until $close is called.
 */
 class MdnsSocket:
+  network_/net.Client
   socket_/udp.MulticastSocket
   mdns-target_/net.SocketAddress
 
@@ -36,6 +49,7 @@ class MdnsSocket:
       --network/net.Client
       --group/net.IpAddress=MDNS-MULTICAST-ADDRESS
       --port/int=MDNS-PORT:
+    network_ = network
     mdns-target_ = net.SocketAddress group port
     socket_ = network.udp-open-multicast
         --port=port

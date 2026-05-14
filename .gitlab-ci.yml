@@ -1,9 +1,28 @@
-image: toitlang/toit:latest
+image: debian:bookworm-slim
 
 stages:
   - test
 
+variables:
+  TOIT_VERSION: "v2.0.0-alpha.193"
+
+# The previously used `toitlang/toit:latest` image is not published, so
+# the pipeline never started.  Install the Toit SDK from the official
+# GitHub release tarball instead; pinning the version makes builds
+# reproducible.
+.toit-setup: &toit-setup
+  - apt-get update -qq
+  - apt-get install -qq -y --no-install-recommends curl ca-certificates make gzip xz-utils tar
+  - curl -fsSL "https://github.com/toitlang/toit/releases/download/${TOIT_VERSION}/toit-linux-x64.tar.gz" -o /tmp/toit.tar.gz
+  - tar -xzf /tmp/toit.tar.gz -C /opt
+  - export PATH="/opt/toit/bin:$PATH"
+  - toit version
+
 test:
   stage: test
+  before_script:
+    - *toit-setup
   script:
+    - export PATH="/opt/toit/bin:$PATH"
+    - toit pkg install
     - make test

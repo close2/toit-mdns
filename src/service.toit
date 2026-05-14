@@ -61,6 +61,7 @@ class MdnsServiceProvider extends services.ServiceProvider
   socket_/MdnsSocket? := null
   cache_/MdnsCache? := null
   query-engine_/QueryEngine? := null
+  receive-task_/Task? := null
 
   group/net.IpAddress
   port/int
@@ -163,14 +164,25 @@ class MdnsServiceProvider extends services.ServiceProvider
 
   decrement-ref_ name/string:
     curr := manager-refs_.get name
-    if not curr: return // Should not happen
-    
+    if not curr:
+      // Defensive: a decrement without a matching increment indicates
+      // an inconsistency in client bookkeeping.  Log so it surfaces
+      // in field diagnostics, but stay alive.
+      log.warn "mDNS decrement-ref_ with no current count" --tags={"name": name}
+      return
+
     new-count := curr - 1
+    if new-count < 0:
+      // Should be unreachable thanks to the guard above and because
+      // we synchronously remove the entry once it reaches zero.  Log
+      // and clamp.
+      log.warn "mDNS ref-count went negative" --tags={"name": name, "count": new-count}
+      new-count = 0
     manager-refs_[name] = new-count
-    
+
     if new-count <= 0:
       manager/StateManager? := managers_.get name
-      if manager: 
+      if manager:
         manager.stop
         managers_.remove name
       manager-refs_.remove name
@@ -183,54 +195,76 @@ class MdnsServiceProvider extends services.ServiceProvider
 
   ensure-socket_:
     if socket_: return
+    // Retain `network` only via $MdnsSocket so that the proxy is kept
+    // alive (see $MdnsSocket for why) and freed exactly when we close
+    // the socket.  If construction throws partway through we close
+    // the half-built socket so we don't leak a network reference.
     network := net.open
-    socket_ = MdnsSocket --network=network --group=group --port=port
-    resolved-local-ip_ = local-ip or network.address
+    new-socket/MdnsSocket? := null
+    try:
+      new-socket = MdnsSocket --network=network --group=group --port=port
+      socket_ = new-socket
+      resolved-local-ip_ = local-ip or network.address
 
-    cache_ = MdnsCache
-    query-engine_ = QueryEngine socket_ cache_
-    
-    // Start receiving loop
-    task::
-      while not closed_:
-        exception := catch:
-          datagram := socket_.receive
-          if closed_: break
-          if not datagram: continue
-          
-          packet-bytes := datagram.data
-          
-          // Parse once to validate the packet. Malformed packets from
-          // non-mDNS multicast traffic are silently skipped.
-          decoded/dns.DecodedPacket? := null
-          parse-exception := catch:
-            decoded = dns.parse packet-bytes
-          if parse-exception:
-            log.debug "mDNS ignoring malformed packet" --tags={"error": parse-exception}
-            continue
+      cache_ = MdnsCache
+      query-engine_ = QueryEngine socket_ cache_
 
-          // Broadcast to all state managers (per-manager isolation).
-          managers_.do: | name manager/StateManager |
-            manager-exception := catch:
-              manager.process-packet decoded --source=datagram.address
-            if manager-exception:
-              log.warn "mDNS manager processing error"
-                  --tags={"error": manager-exception, "manager": name}
+      // Start receiving loop and remember the task so $close can
+      // cancel it deterministically instead of relying on the loop
+      // catching the post-close receive error.
+      receive-task_ = task::
+        try:
+          receive-loop_
+        finally:
+          if receive-task_ == Task.current: receive-task_ = null
+      // Hand-off succeeded; suppress the cleanup below.
+      new-socket = null
+    finally:
+      if new-socket:
+        // Constructor or follow-up code threw — drop the half-built
+        // socket so the network proxy can be released.
+        new-socket.close
+        socket_ = null
 
-          // Allow QueryEngine to process answers/updates.
-          // RFC 6762 §7.3: "A Multicast DNS querier MUST NOT cache
-          //  resource records observed in the Known-Answer Section of
-          //  other Multicast DNS queries." — Only cache from responses.
-          if decoded.is-response:
-            query-exception := catch:
-              query-engine_.process-packet decoded
-            if query-exception:
-              log.warn "mDNS query-engine processing error"
-                  --tags={"error": query-exception}
-        if exception:
-          if not closed_: log.error "mDNS receive error" --tags={"error": exception}
-          break
-      socket_.close
+  receive-loop_:
+    while not closed_:
+      exception := catch:
+        datagram := socket_.receive
+        if closed_: return
+        if not datagram: continue
+
+        packet-bytes := datagram.data
+
+        // Parse once to validate the packet. Malformed packets from
+        // non-mDNS multicast traffic are silently skipped.
+        decoded/dns.DecodedPacket? := null
+        parse-exception := catch:
+          decoded = dns.parse packet-bytes
+        if parse-exception:
+          log.debug "mDNS ignoring malformed packet" --tags={"error": parse-exception}
+          continue
+
+        // Broadcast to all state managers (per-manager isolation).
+        managers_.do: | name manager/StateManager |
+          manager-exception := catch:
+            manager.process-packet decoded --source=datagram.address
+          if manager-exception:
+            log.warn "mDNS manager processing error"
+                --tags={"error": manager-exception, "manager": name}
+
+        // Allow QueryEngine to process answers/updates.
+        // RFC 6762 §7.3: "A Multicast DNS querier MUST NOT cache
+        //  resource records observed in the Known-Answer Section of
+        //  other Multicast DNS queries." — Only cache from responses.
+        if decoded.is-response:
+          query-exception := catch:
+            query-engine_.process-packet decoded
+          if query-exception:
+            log.warn "mDNS query-engine processing error"
+                --tags={"error": query-exception}
+      if exception:
+        if not closed_: log.error "mDNS receive error" --tags={"error": exception}
+        return
 
   closed_/bool := false
   
@@ -238,7 +272,12 @@ class MdnsServiceProvider extends services.ServiceProvider
     closed_ = true
     managers_.do: | name manager/StateManager |
       manager.stop
-    if socket_: socket_.close
+    if receive-task_:
+      receive-task_.cancel
+      receive-task_ = null
+    if socket_:
+      socket_.close
+      socket_ = null
 
   lookup name/string -> List
       --accept-ipv4/bool
