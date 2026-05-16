@@ -42,7 +42,20 @@ parse packet/ByteArray -> dns.DecodedPacket:
   auth-count     := reader.big-endian.read-uint16
   add-count      := reader.big-endian.read-uint16
 
-  result := dns.DecodedPacket --id=received-id --status-bits=status-bits
+  // RFC 6762 §18.4 / §18.5 / §18.6 / §18.7 / §18.10 / §18.12: The AA, TC,
+  // RD, RA, Z, AD, and CD header bits MUST be ignored on reception in
+  // mDNS messages. The SDK's DecodedPacket constructor, however, treats
+  // any of these reserved bits (mask 0x6070 — Z, AD, CD plus a reserved
+  // bit) as a protocol error, which silently drops otherwise-valid
+  // queries. Android NSD, for example, sets the AD bit (0x0020) on
+  // every multicast query (flags 0x0120), which makes the SDK reject
+  // those packets and prevents the device from answering nebenuhr.local
+  // lookups from Android. Pre-mask these reserved bits so the lenient
+  // mDNS parser conforms to RFC 6762 §18 instead of inheriting the
+  // SDK's strict unicast-DNS validation.
+  sanitized-bits := status-bits & ~0x6070
+
+  result := dns.DecodedPacket --id=received-id --status-bits=sanitized-bits
 
   queries.repeat:
     question := decode-question_ reader packet

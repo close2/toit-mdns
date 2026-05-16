@@ -10,6 +10,7 @@ import mdns.net.dns_helper as dns
 main:
   test-packet-with-opt-record
   test-pure-mdns-defense-response
+  test-android-style-ad-bit-query
   print "All lenient parser tests passed."
 
 // Builds: header + one question + one OPT record (class != IN).
@@ -69,3 +70,39 @@ test-pure-mdns-defense-response:
   expect-equals 1 packet.resources.size
   resource := packet.resources[0]
   expect-equals "nebenuhr.local" resource.name
+
+// Android NSD multicasts queries with the DNSSEC "Authenticated Data"
+// header bit set (flags = 0x0120). RFC 6762 §18.4–§18.12 says reserved
+// header bits MUST be ignored on reception, but the SDK's DecodedPacket
+// constructor treats them as a protocol error and throws, silently
+// dropping the entire packet. Verify the lenient parser masks the
+// reserved bits so Android lookups for nebenuhr.local actually get
+// dispatched to the responder.
+test-android-style-ad-bit-query:
+  buf := #[
+    0x13, 0x65,             // ID
+    0x01, 0x20,             // Flags: RD=1, AD=1 (the Android pattern).
+    0x00, 0x01,             // 1 question
+    0x00, 0x00,             // 0 answers
+    0x00, 0x00,             // 0 authorities
+    0x00, 0x01,             // 1 additional (an OPT record)
+    // Question: "nebenuhr.local" type A class IN
+    0x08, 'n', 'e', 'b', 'e', 'n', 'u', 'h', 'r',
+    0x05, 'l', 'o', 'c', 'a', 'l',
+    0x00,
+    0x00, 0x01,             // QTYPE = A
+    0x00, 0x01,             // QCLASS = IN
+    // OPT pseudo-record (Android-style padding).
+    0x00,                   // root name
+    0x00, 0x29,             // type = OPT (41)
+    0x20, 0x00,             // class = 8192 (UDP payload size)
+    0x00, 0x00, 0x00, 0x80, // TTL/extended-flags (DO bit)
+    0x00, 0x00,             // RDLENGTH = 0
+  ]
+  packet := dns.parse buf
+  expect-equals 1 packet.questions.size
+  expect-equals "nebenuhr.local" packet.questions[0].name
+  expect-not packet.is-response
+  // Reserved bits must have been masked away so downstream consumers
+  // never see the AD bit (0x0020) or any other reserved bit set.
+  expect-equals 0 (packet.status-bits & 0x6070)
