@@ -516,8 +516,25 @@ class StateManager:
        
     packet := dns.create-dns-packet questions answers --id=0 --is-response --is-authoritative
     if socket_.is-closed: return
+    now := Time.monotonic-us
+    answers.do: | rec |
+      last-multicast-times_["$rec.name:$rec.type"] = now
     // Best-effort — see send-probe_ comment.
     catch --trace: socket_.send packet
+
+  /**
+  Returns true if the record for $name and $type has been multicast within
+  one quarter of $ttl-s seconds (RFC 6762 §5.4).
+  When receiving a question with the QU (unicast-response) bit set, a
+  responder SHOULD respond via unicast only if the record was multicast
+  within the last TTL/4; otherwise it SHOULD multicast the response to
+  keep peer caches fresh and permit passive conflict detection.
+  */
+  was-multicast-within-quarter-ttl_ name/string type/int ttl-s/int now/int -> bool:
+    last := last-multicast-times_.get "$name:$type"
+    if not last: return false
+    quarter-ttl-us := ttl-s * 250_000
+    return (now - last) < quarter-ttl-us
 
   /**
   Sends a response to a query.
@@ -527,7 +544,8 @@ class StateManager:
   send-response_ query/dns.DecodedPacket? --source/net.SocketAddress?=null:
     unicast-answers := []
     multicast-answers := []
-    legacy-query := source and source.port != expected-port_
+    legacy-query := source != null and source.port != expected-port_
+    now := Time.monotonic-us
 
     // 1. Hostname A Record
     q-host := find-question_ query hostname_ dns.RECORD-A
@@ -538,7 +556,9 @@ class StateManager:
       // RFC 6762 §7.1: Suppress if already in Known-Answer Section
       // with TTL ≥ 50% of our real TTL.
       if not query or not dns.has-known-answer query hostname_ dns.RECORD-A 120 --record=host-answer:
-        target := legacy-query or q-host.unicast-ok ? unicast-answers : multicast-answers
+        use-unicast := legacy-query or
+            (source != null and q-host.unicast-ok and (was-multicast-within-quarter-ttl_ hostname_ dns.RECORD-A 120 now))
+        target := use-unicast ? unicast-answers : multicast-answers
         target.add host-answer
     else if not query:
       // Announcement
@@ -572,8 +592,9 @@ class StateManager:
             false  // RFC 6763 §9: shared record, no cache-flush.
             s.type-domain
         if not (query and dns.has-known-answer query "_services._dns-sd._udp.local" dns.RECORD-PTR 4500 --record=meta-answer):
-          is-unicast := legacy-query or q-meta.unicast-ok
-          (is-unicast ? unicast-answers : multicast-answers).add meta-answer
+          use-unicast := legacy-query or
+              (source != null and q-meta.unicast-ok and (was-multicast-within-quarter-ttl_ "_services._dns-sd._udp.local" dns.RECORD-PTR 4500 now))
+          (use-unicast ? unicast-answers : multicast-answers).add meta-answer
 
       // Type-domain PTR: answer with PTR(type-domain -> instance) plus
       // SRV/TXT/A additionals. RFC 6763 §12.1 recommends including
@@ -588,8 +609,9 @@ class StateManager:
         ptr-suppressed := query and
             dns.has-known-answer query s.type-domain dns.RECORD-PTR 4500 --record=ptr-answer
         if not ptr-suppressed:
-          is-unicast := legacy-query or q-ptr.unicast-ok
-          target := is-unicast ? unicast-answers : multicast-answers
+          use-unicast := legacy-query or
+              (source != null and q-ptr.unicast-ok and (was-multicast-within-quarter-ttl_ s.type-domain dns.RECORD-PTR 4500 now))
+          target := use-unicast ? unicast-answers : multicast-answers
           target.add ptr-answer
           target.add (dns.SrvResource s.full-name dns.RECORD-SRV srv-ttl additional-flush hostname_ 0 0 s.port)
           txt-list := build-txt-list_ s.txt
@@ -600,8 +622,10 @@ class StateManager:
       q-srv := find-question_ query s.full-name dns.RECORD-SRV
       q-txt := find-question_ query s.full-name dns.RECORD-TXT
       if q-srv or q-txt:
-        is-unicast := legacy-query or (q-srv and q-srv.unicast-ok) or (q-txt and q-txt.unicast-ok)
-        target := is-unicast ? unicast-answers : multicast-answers
+        srv-ok := not q-srv or (q-srv.unicast-ok and (was-multicast-within-quarter-ttl_ s.full-name dns.RECORD-SRV 120 now))
+        txt-ok := not q-txt or (q-txt.unicast-ok and (was-multicast-within-quarter-ttl_ s.full-name dns.RECORD-TXT 4500 now))
+        use-unicast := legacy-query or (source != null and srv-ok and txt-ok)
+        target := use-unicast ? unicast-answers : multicast-answers
         if q-srv:
           target.add (dns.SrvResource s.full-name dns.RECORD-SRV srv-ttl additional-flush hostname_ 0 0 s.port)
         if q-txt:
@@ -626,19 +650,16 @@ class StateManager:
     if not multicast-answers.is-empty:
       // RFC 6762 §6: Per-record rate limiting — suppress only records
       // already sent within the last second.
-      now := Time.monotonic-us
       filtered := multicast-answers.filter: | rec |
         key := "$rec.name:$rec.type"
         last := last-multicast-times_.get key
-        not last or (now - last) >= 1_000_000
+        not last or (now - last) >= MULTICAST-RATE-LIMIT-WINDOW-US_
       if filtered.is-empty: return
       filtered.do: | rec |
         last-multicast-times_["$rec.name:$rec.type"] = now
 
-      // Prune entries older than the rate-limiting window so the map
-      // does not grow unboundedly as records come and go (renames,
-      // service churn, transient cache responses).  Bounding the
-      // table also keeps the hot path's hash lookups cheap.
+      // Prune entries older than the maximum quarter-TTL window so the
+      // map does not grow unboundedly as records come and go.
       prune-last-multicast-times_ now
 
       // For Multicast, ID must be 0 (RFC 6762 §18.1)
@@ -646,16 +667,16 @@ class StateManager:
       // Best-effort multicast send — see send-probe_ for rationale.
       catch --trace: socket_.send packet // Uses default multicast target
 
-  // Entries older than this are no longer needed: the rate-limit
-  // window has elapsed, so a fresh "last sent" timestamp would not
-  // suppress the next multicast anyway.  Pruning is O(n) and runs
-  // only after a successful multicast — bounded by mDNS traffic.
+  // Per-record multicast rate limit (RFC 6762 §6: at most once per second).
   static MULTICAST-RATE-LIMIT-WINDOW-US_ ::= 1_000_000
+  // Quarter of the longest TTL we emit (4500s / 4 = 1125s), used for
+  // RFC 6762 §5.4 QU multicast decisions.
+  static MAX-QU-MULTICAST-WINDOW-US_ ::= 4500 * 250_000
 
   prune-last-multicast-times_ now/int -> none:
     stale := []
     last-multicast-times_.do: | key timestamp |
-      if now - timestamp >= MULTICAST-RATE-LIMIT-WINDOW-US_: stale.add key
+      if now - timestamp >= MAX-QU-MULTICAST-WINDOW-US_: stale.add key
     stale.do: last-multicast-times_.remove it
 
   find-question_ query/dns.DecodedPacket? name/string type/int -> dns.Question?:
