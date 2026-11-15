@@ -1,138 +1,135 @@
 /**
 mDNS response cache.
 
-Caches DNS resource records learned from multicast responses.  The
-cache is **opt-in** — records are only stored for names actively
-being looked up.  This avoids the unbounded growth that comes from
-passively absorbing every multicast packet on a busy LAN (each
-record's TTL is typically 4500 s, so passive caching is effectively
-a slow leak).
-
-# Cache Key Design
-
-Records are keyed by (name, type, class) tuple. Multiple records can exist
-for the same key (e.g., multiple A records for a host, or multiple PTR
-records for a service type).
-
-# TTL Handling
-
-Each cached record carries an expiry timestamp based on its TTL. The cache
-periodically prunes expired entries. Identical records (same name, type,
-and data) have their TTL refreshed rather than creating duplicates.
-
-# Cleanup
-
-Expired entries are pruned lazily on lookup (no background task; that
-would consume one Toit task per cleanup pass on a tiny ESP32 heap).
-The pass is throttled to once per second.
+Caches DNS resource records learned from multicast responses for names
+actively being queried (plus their DNS-SD additional records). Both key
+count and per-key entry lists are bounded so cache memory stays small and
+predictable on ESP32 heaps.
 */
 
-import net
 import net.modules.dns
+import ..net.dns-helper as dns-helper
 
 /**
-Single cache entry with expiration tracking.
+Single cache entry with creation and expiration timestamps.
 */
 class CacheEntry:
   record/dns.Resource
-  expiry/int // Monotonic microsecond timestamp
+  received-us/int
+  expiry/int  // Monotonic microsecond timestamp.
 
-  constructor .record .expiry:
+  constructor .record .received-us .expiry:
 
 /**
-mDNS response cache.
-
-Stores DNS resource records indexed by (name, type, class) key. Each key
-can have multiple records (e.g., a host with multiple IP addresses).
-
-Records are automatically expired based on their TTL, with cleanup
-throttled to avoid excessive CPU usage during high-traffic periods.
+Bounded mDNS response cache indexed by `(name, type, class)`.
 */
 class MdnsCache:
-  // Map from Key(name, type, class) -> List<CacheEntry>
+  // Map from Key("name:type:class") -> List<CacheEntry>.
   records_/Map := {:}
 
-  // Cleanup throttling: Only cleanup once per second (1_000_000 microseconds)
   static CLEANUP-INTERVAL-US_ ::= 1_000_000
-  // Hard cap on the number of distinct (name,type,class) keys.  When
-  // we hit it the oldest expiring entries are dropped.  64 keys is
-  // ample for a slave-clock controller (we look up at most a handful
-  // of hostnames at a time) and keeps the worst-case cache footprint
-  // well under 4 kB.
   static MAX-KEYS_ ::= 64
+  static MAX-ENTRIES-PER-KEY_ ::= 32
+  static MAX-TTL-S_ ::= 86_400
   last-cleanup-us_/int := 0
 
   /**
-  Adds a record to the cache.
+  Adds or refreshes $record in the cache.
 
-  RFC 6762 §10.1: A record received with TTL=0 is a "goodbye"; we keep
-    it for one second so existing listeners can update their state, and
-    then it is pruned by the normal expiry path.
-  RFC 6762 §10.2: When a record is received with the cache-flush bit
-    set, all earlier cached records with the same (name, type, class)
-    that are more than one second old MUST be flushed. Records received
-    in the last second are kept so that multi-packet responses don't
-    accidentally invalidate each other.
+  - RFC 6762 §10.1: `TTL == 0` is a goodbye; matching entries are retained
+    for 1 second and then evicted.
+  - RFC 6762 §10.2: `record.flush` evicts same `(name, type, class)` entries
+    received more than 1 second ago while preserving entries from the past
+    second so multi-packet responses do not invalidate each other.
   */
-  add record/dns.Resource:
-    key := build-key_ record.name record.type 1 // Class IN
+  add record/dns.Resource -> none:
+    key := build-key_ record.name record.type dns.CLASS-INTERNET
     list := records_.get key --init=(: [])
 
     now := Time.monotonic-us
-    // RFC 6762 §10.1: TTL=0 means "goodbye"; treat as 1-second TTL.
-    effective-ttl := record.ttl > 0 ? record.ttl : 1
+    effective-ttl := record.ttl > 0 ? (min record.ttl MAX-TTL-S_) : 1
     expiry := now + (effective-ttl * 1_000_000)
 
-    // RFC 6762 §10.2: cache-flush bit on a unique record evicts older
-    // entries of the same type from the cache.
     if record.flush:
-      flush-cutoff := now - 1_000_000  // Keep entries seen in the last 1s.
+      flush-cutoff := now - 1_000_000
       list.filter --in-place: | entry/CacheEntry |
-        // Identical records are refreshed below, regardless of age.
-        (equal_ entry.record record) or
-            // Newer entries (received within the past second) are kept.
-            entry.expiry - (entry.record.ttl > 0 ? entry.record.ttl : 1) * 1_000_000 > flush-cutoff
+        (dns-helper.resource-equals entry.record record) or entry.received-us > flush-cutoff
 
-    // If an identical record is already cached, just refresh its TTL
-    // in place.  Stop scanning as soon as we find the match.
     list.size.repeat: | i |
       entry/CacheEntry := list[i]
-      if equal_ entry.record record:
-        list[i] = CacheEntry record expiry
+      if dns-helper.resource-equals entry.record record:
+        list[i] = CacheEntry record now expiry
         return
 
-    list.add (CacheEntry record expiry)
+    if list.size >= MAX-ENTRIES-PER-KEY_:
+      evict-oldest-in-list_ list
+    list.add (CacheEntry record now expiry)
     if records_.size > MAX-KEYS_: evict-one_
 
+  /** Returns unexpired $dns.Resource records for $name and $type. */
   lookup name/string type/int -> List:
     cleanup_
-    key := build-key_ name type 1
+    key := build-key_ name type dns.CLASS-INTERNET
     list := records_.get key --if-absent=(: return [])
-    // Belt-and-braces: cleanup_ is throttled to once per second, so
-    // filter expired entries here too. This also matters for goodbye
-    // records (TTL=0, expiry≈now) which would otherwise leak through
-    // the throttle.
     now := Time.monotonic-us
-    fresh := list.filter: | entry/CacheEntry | entry.expiry > now
-    return fresh.map: it.record
+    result := []
+    list.do: | entry/CacheEntry |
+      if entry.expiry > now:
+        result.add entry.record
+    return result
 
-  // Remove expired records.  Synchronous: we run inside whatever task
-  // happened to call us.  The throttle keeps the cost amortised.
-  cleanup_:
+  /**
+  Returns unexpired records cloned with their remaining TTL in whole seconds
+  and `flush = false`, suitable for populating a query's Known-Answer section
+  per RFC 6762 §7.1.
+  */
+  lookup-known-answers name/string type/int -> List:
+    cleanup_
+    key := build-key_ name type dns.CLASS-INTERNET
+    list := records_.get key --if-absent=(: return [])
+    now := Time.monotonic-us
+    result := []
+    list.do: | entry/CacheEntry |
+      remaining-s := (entry.expiry - now) / 1_000_000
+      // Goodbye entries (<= 1s left) must not be placed in Known-Answers.
+      if entry.record.ttl > 0 and remaining-s >= 2:
+        cloned := clone-with-ttl_ entry.record remaining-s
+        if cloned: result.add cloned
+    return result
+
+  clone-with-ttl_ res/dns.Resource ttl/int -> dns.Resource?:
+    if res is dns.AResource:
+      return dns.AResource res.name res.type ttl false (res as dns.AResource).address
+    if res is dns.SrvResource:
+      srv := res as dns.SrvResource
+      return dns.SrvResource srv.name srv.type ttl false srv.value srv.priority srv.weight srv.port
+    if res is dns.TxtResource:
+      return dns.TxtResource res.name ttl false (res as dns.TxtResource).text
+    if res is dns.StringResource:
+      return dns.StringResource res.name res.type ttl false (res as dns.StringResource).value
+    return null
+
+  cleanup_ -> none:
     now := Time.monotonic-us
     if now - last-cleanup-us_ < CLEANUP-INTERVAL-US_: return
     last-cleanup-us_ = now
 
-    records_.filter --in-place: | _ list |
+    records_.filter --in-place: | _ list/List |
       list.filter --in-place: | entry/CacheEntry |
         entry.expiry > now
       not list.is-empty
 
-  /**
-  Drops the key whose entries expire soonest.  Called when the cache
-  exceeds $MAX-KEYS_; this is a coarse but cheap LRU-like policy that
-  prevents unbounded growth on networks with lots of mDNS chatter.
-  */
+  evict-oldest-in-list_ list/List -> none:
+    if list.is-empty: return
+    oldest-idx := 0
+    oldest-expiry := (list[0] as CacheEntry).expiry
+    for i := 1; i < list.size; i++:
+      exp := (list[i] as CacheEntry).expiry
+      if exp < oldest-expiry:
+        oldest-expiry = exp
+        oldest-idx = i
+    list.remove --at=oldest-idx
+
   evict-one_ -> none:
     earliest-key/string? := null
     earliest-expiry/int := int.MAX
@@ -144,38 +141,4 @@ class MdnsCache:
     if earliest-key: records_.remove earliest-key
 
   build-key_ name/string type/int klass/int -> string:
-    // RFC 6762 §16: DNS names are case-insensitive for ASCII letters.
-    // Normalize to lowercase so "Host.local" and "host.local" hit the
-    // same cache key.
     return "$(name.to-ascii-lower):$type:$klass"
-
-  /**
-  Checks if two resources are equal, ignoring the TTL.
-
-  We can't implement and use `operator==` or `hash-code` on the resources because those
-  should include the TTL. Here we want to identify if the record data has
-  changed, regardless of the TTL.
-  */
-  equal_ a/dns.Resource b/dns.Resource -> bool:
-    if a.type != b.type or a.flush != b.flush: return false
-    // Case-insensitive name comparison per RFC 6762 §16.
-    if a.name.to-ascii-lower != b.name.to-ascii-lower: return false
-    // Deep equality check used for updating TTLs of identical records.
-    // SrvResource extends StringResource, so check SrvResource first.
-    if a is dns.SrvResource and b is dns.SrvResource:
-      srv-a := a as dns.SrvResource
-      srv-b := b as dns.SrvResource
-      return srv-a.priority == srv-b.priority and
-        srv-a.weight == srv-b.weight and
-        srv-a.port == srv-b.port and
-        srv-a.value.to-ascii-lower == srv-b.value.to-ascii-lower
-    if a is dns.AResource and b is dns.AResource:
-      return (a as dns.AResource).address == (b as dns.AResource).address
-    if a is dns.StringResource and b is dns.StringResource:
-      // Covers PTR, CNAME, and TXT records.
-      // PTR/CNAME values are DNS names → compare case-insensitively.
-      // TXT values are arbitrary octets but the SDK exposes them as a
-      // List of strings via TxtResource; they don't reach this branch.
-      return (a as dns.StringResource).value.to-ascii-lower ==
-          (b as dns.StringResource).value.to-ascii-lower
-    return false

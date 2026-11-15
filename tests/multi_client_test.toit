@@ -101,7 +101,7 @@ resolve socket/MdnsSocket name/string -> bool:
           parsed := dns.decode-packet datagram.data
           if parsed.is-response:
             parsed.resources.do: | res |
-              if res.name == name and res.type == dns.RECORD-A:
+              if res.name == name and res.type == dns.RECORD-A and res.ttl > 0:
                 return true
   return false
 

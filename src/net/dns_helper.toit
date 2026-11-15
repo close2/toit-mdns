@@ -1,39 +1,80 @@
 /**
-DNS packet parsing and inspection utilities.
+DNS packet parsing, serialization, and mDNS inspection utilities.
 
-Thin wrappers around the SDK's dns module that provide mDNS-specific
-packet analysis. These helpers are used by the state manager to detect
-conflicts and identify relevant queries.
-
-# Authoritative Response Detection
-
-In mDNS, an "authoritative" response from another device for our
-claimed name indicates a conflict. We check both the response flag
-and the authoritative flag per RFC 6762 Section 9.
-
-# Simultaneous Probe Tiebreaking (RFC 6762 Section 8.2)
-
-When two hosts probe for the same name simultaneously, tiebreaking is
-done by comparing the proposed records in the Authority Section.
-The host with lexicographically later rdata wins. The loser defers
-by waiting one second, then re-probes.
+Provides a hardened, bounded mDNS wire parser and encoder on top of the
+SDK's `dns` types:
+- Enforces RFC 1035 / RFC 9267 compression-pointer safety (strictly
+  backward pointers, max hop limit, 63-octet label limit, 255-octet wire
+  name limit, per-packet memoization, and section record caps) so crafted
+  packets cannot trigger stack overflow or OOM on ESP32 heaps.
+- Masks reserved header bits (`Z`, `AD`, `CD`) per RFC 6762 §18 while
+  preserving all non-zero `OPCODE` (`1..15`) and `RCODE` values for
+  validation.
+- Decodes and encodes multi-string / binary-safe `TXT` records and
+  restricted-form `NSEC` negative responses (RFC 6762 §6.1).
+- Implements RFC 6762 §8.2 pairwise lexicographic probe tiebreaking and
+  §9 conflict detection across Answer, Authority, and Additional sections.
 */
 
 import io
 import net
 import net.modules.dns
 
+/// DNSSEC / mDNS NSEC record type (RFC 4034 / RFC 6762 §6.1).
+RECORD-NSEC ::= 47
+
+/// Maximum uncompressed wire domain-name length in octets (RFC 1035 §2.3.4).
+MAX-NAME-LENGTH_ ::= 255
+/// Maximum compression-pointer jumps permitted while decoding one name.
+MAX-POINTER-HOPS_ ::= 16
+/// Upper bound on questions per packet to reject compression-bomb DoS packets.
+MAX-QUESTIONS_ ::= 64
+/// Upper bound on resource records per packet on constrained ESP32 heaps.
+MAX-RECORDS_ ::= 128
+
+/**
+Restricted-form mDNS NSEC resource record (RFC 6762 §6.1).
+
+Asserts which record $types (in Window Block 0, `0..255`) exist for $name
+and that no other record types exist for that unique domain name.
+*/
+class NsecResource extends dns.Resource:
+  next-domain/string
+  types/List  // List<int> of present RR type codes in 0..255.
+
+  constructor name/string ttl/int flush/bool .next-domain .types:
+    super name RECORD-NSEC ttl flush
+
+  /** Returns true if $rr-type is marked present in the NSEC bitmap. */
+  has-type rr-type/int -> bool:
+    return types.contains rr-type
+
+/**
+Fast zero-allocation check on a raw UDP payload before full parsing.
+
+Returns false if $packet is shorter than the 12-byte DNS header or has a
+non-zero `OPCODE` (RFC 6762 §18.3) or `RCODE` (RFC 6762 §18.11).
+*/
+is-valid-raw-mdns-header packet/ByteArray -> bool:
+  if packet.size < 12: return false
+  opcode := (packet[2] >> 3) & 0x0f
+  if opcode != 0: return false
+  rcode := packet[3] & 0x0f
+  if rcode != 0: return false
+  return true
+
 /**
 Decodes a raw packet into a $dns.DecodedPacket.
 
-Uses a lenient mDNS decoder that tolerates records whose CLASS is
-not IN. Such records (OPT pseudo-records that carry a UDP payload
-size in the class field, IXFR/AXFR variants, etc.) are silently
-skipped instead of failing the whole packet, which would otherwise
-hide legitimate IN-class records — including the very conflict
-responses we rely on for hostname defense.
+Uses a hardened lenient mDNS decoder that:
+- Tolerates records whose CLASS is not IN (e.g. EDNS0 OPT pseudo-records).
+- Masks reserved header bits (`Z`, `AD`, `CD`) per RFC 6762 §18 while
+  preserving non-zero `OPCODE` values (`1..15`) so $is-valid-mdns-message
+  rejects all non-zero opcodes (including `NOTIFY` = 4).
+- Bounds name compression pointers, wire lengths, and record counts.
 */
 parse packet/ByteArray -> dns.DecodedPacket:
+  if packet.size < 12: throw "TRUNCATED_DNS_PACKET"
   reader := io.Reader packet
   received-id    := reader.big-endian.read-uint16
   status-bits    := reader.big-endian.read-uint16
@@ -42,62 +83,67 @@ parse packet/ByteArray -> dns.DecodedPacket:
   auth-count     := reader.big-endian.read-uint16
   add-count      := reader.big-endian.read-uint16
 
-  // RFC 6762 §18.4 / §18.5 / §18.6 / §18.7 / §18.10 / §18.12: The AA, TC,
-  // RD, RA, Z, AD, and CD header bits MUST be ignored on reception in
-  // mDNS messages. The SDK's DecodedPacket constructor, however, treats
-  // any of these reserved bits (mask 0x6070 — Z, AD, CD plus a reserved
-  // bit) as a protocol error, which silently drops otherwise-valid
-  // queries. Android NSD, for example, sets the AD bit (0x0020) on
-  // every multicast query (flags 0x0120), which makes the SDK reject
-  // those packets and prevents the device from answering nebenuhr.local
-  // lookups from Android. Pre-mask these reserved bits so the lenient
-  // mDNS parser conforms to RFC 6762 §18 instead of inheriting the
-  // SDK's strict unicast-DNS validation.
-  sanitized-bits := status-bits & ~0x6070
+  if queries > MAX-QUESTIONS_ or (response-count + auth-count + add-count) > MAX-RECORDS_:
+    throw "DNS_PACKET_TOO_MANY_RECORDS"
+
+  // RFC 6762 §18: Reserved bits Z, AD, CD (0x0070) MUST be ignored on
+  // reception (Android NSD sets AD=1 on multicast queries).
+  // However, SDK's DecodedPacket throws if opcode > 2 (upper opcode bits
+  // 0x6000). Preserve any non-zero opcode (1..15) as opcode=1 so
+  // DecodedPacket constructs cleanly and is-valid-mdns-message returns false.
+  raw-opcode := (status-bits & 0x7800) >> 11
+  sanitized-bits := status-bits & ~0x0070
+  if raw-opcode != 0:
+    sanitized-bits = (sanitized-bits & ~0x7800) | 0x0800
 
   result := dns.DecodedPacket --id=received-id --status-bits=sanitized-bits
+  name-cache := {:}
 
   queries.repeat:
-    question := decode-question_ reader packet
+    question := decode-question_ reader packet name-cache
     if question: result.questions.add question
 
   response-count.repeat:
-    resource := decode-resource_ reader packet
+    resource := decode-resource_ reader packet name-cache
     if resource: result.resources.add resource
 
   auth-count.repeat:
-    resource := decode-resource_ reader packet
+    resource := decode-resource_ reader packet name-cache
     if resource: result.authorities.add resource
 
   add-count.repeat:
-    resource := decode-resource_ reader packet
+    resource := decode-resource_ reader packet name-cache
     if resource: result.additionals.add resource
 
   return result
 
-decode-question_ reader/io.Reader packet/ByteArray -> dns.Question?:
-  q-name := dns.decode-name reader packet
+decode-question_ reader/io.Reader packet/ByteArray name-cache/Map -> dns.Question?:
+  q-name := decode-name_ reader packet name-cache
+  if reader.processed + 4 > packet.size: throw "TRUNCATED_DNS_QUESTION"
   q-type := reader.big-endian.read-uint16
   q-class := reader.big-endian.read-uint16
   unicast-ok := q-class & 0x8000 != 0
-  // mDNS uses CLASS-ANY (255) for cache-flush queries and OPT-style
-  // questions can have non-IN class. Skip unsupported classes
-  // silently instead of throwing.
-  if q-class & 0x7fff != dns.CLASS-INTERNET and q-class & 0x7fff != 0xff:
+  // mDNS uses CLASS-INTERNET (1) or CLASS-ANY (255). Skip unsupported classes.
+  masked-class := q-class & 0x7fff
+  if masked-class != dns.CLASS-INTERNET and masked-class != 0xff:
     return null
   return dns.Question q-name q-type --unicast-ok=unicast-ok
 
-decode-resource_ reader/io.Reader packet/ByteArray -> dns.Resource?:
-  r-name := dns.decode-name reader packet
+decode-resource_ reader/io.Reader packet/ByteArray name-cache/Map -> dns.Resource?:
+  r-name := decode-name_ reader packet name-cache
+  if reader.processed + 10 > packet.size: throw "TRUNCATED_DNS_RECORD"
   type := reader.big-endian.read-uint16
   clas := reader.big-endian.read-uint16
   ttl := reader.big-endian.read-int32
+  // RFC 2181 §8: TTL values with the MSB set (negative int32) are treated as 0.
+  if ttl < 0: ttl = 0
   rd-length := reader.big-endian.read-uint16
 
+  if reader.processed + rd-length > packet.size:
+    throw "TRUNCATED_DNS_RDATA"
+
   flush := clas & 0x8000 != 0
-  // Skip records with unexpected class (e.g. OPT records carry
-  // requestor's UDP payload size in the class field). The rest of
-  // the packet must still parse.
+  // Skip records with non-IN class (e.g. EDNS0 OPT pseudo-records).
   if clas & 0x7fff != dns.CLASS-INTERNET:
     reader.skip rd-length
     return null
@@ -106,44 +152,278 @@ decode-resource_ reader/io.Reader packet/ByteArray -> dns.Resource?:
   result/dns.Resource? := null
   if type == dns.RECORD-A or type == dns.RECORD-AAAA:
     length := type == dns.RECORD-A ? 4 : 16
-    if rd-length == length:
-      result = dns.AResource r-name type ttl flush
-          net.IpAddress (reader.read-bytes length)
+    if rd-length != length: throw "CORRUPT_ADDRESS_RECORD"
+    result = dns.AResource r-name type ttl flush
+        net.IpAddress (reader.read-bytes length)
   else if type == dns.RECORD-PTR or type == dns.RECORD-CNAME:
     result = dns.StringResource r-name type ttl flush
-        dns.decode-name reader packet
+        decode-name_ reader packet name-cache
   else if type == dns.RECORD-TXT:
-    value := ""
-    if rd-length > 0:
-      length := reader.read-byte
-      if rd-length >= length + 1:
-        value = reader.read-string length
-    result = dns.StringResource r-name type ttl flush value
+    strings := []
+    remaining := rd-length
+    while remaining > 0:
+      str-len := reader.read-byte
+      remaining--
+      if str-len > remaining: throw "CORRUPT_TXT_RECORD"
+      // RFC 6763 §6.5: TXT values may contain arbitrary binary data. Keep
+      // valid UTF-8 as `string` and preserve anything else as raw `ByteArray`.
+      bytes := reader.read-bytes str-len
+      strings.add (bytes.is-valid-string-content ? bytes.to-string : bytes)
+      remaining -= str-len
+    result = dns.TxtResource r-name ttl flush strings
   else if type == dns.RECORD-SRV:
+    if rd-length < 7: throw "CORRUPT_SRV_RECORD"
     priority := reader.big-endian.read-uint16
     weight := reader.big-endian.read-uint16
     port := reader.big-endian.read-uint16
-    value := dns.decode-name reader packet
+    value := decode-name_ reader packet name-cache
     result = dns.SrvResource r-name type ttl flush value priority weight port
+  else if type == RECORD-NSEC:
+    next-domain := decode-name_ reader packet name-cache
+    types := []
+    while (reader.processed - read-before) < rd-length:
+      if (rd-length - (reader.processed - read-before)) < 2:
+        throw "CORRUPT_NSEC_RECORD"
+      window := reader.read-byte
+      bm-len := reader.read-byte
+      if bm-len < 1 or bm-len > 32: throw "CORRUPT_NSEC_RECORD"
+      if (reader.processed - read-before) + bm-len > rd-length:
+        throw "CORRUPT_NSEC_RECORD"
+      bm := reader.read-bytes bm-len
+      bm-len.repeat: | byte-idx |
+        b := bm[byte-idx]
+        if b != 0:
+          8.repeat: | bit |
+            if (b & (0x80 >> bit)) != 0:
+              types.add ((window << 8) | (byte-idx << 3) | bit)
+    result = NsecResource r-name ttl flush next-domain types
 
   read-after := reader.processed
   to-skip := rd-length - (read-after - read-before)
   if to-skip < 0:
-    // Record reader over-consumed; corrupt record. Skip rest of packet.
-    return null
+    throw "CORRUPT_DNS_RECORD"
   reader.skip to-skip
   return result
 
 /**
+Bounded, non-recursive DNS domain-name decoder.
+
+Enforces:
+- Strictly backward compression pointers (`12 <= target < current_offset`),
+  preventing self-loops and mutual pointer cycles in O(1) space.
+- Maximum $MAX-POINTER-HOPS_ pointer jumps.
+- Label length `<= 63` octets and total uncompressed wire name `<= 255` octets.
+- Per-packet pointer target memoization via $name-cache so repeated
+  compressed references reuse the same immutable string instance.
+*/
+decode-name_ reader/io.Reader packet/ByteArray name-cache/Map?=null -> string:
+  start-pos := reader.processed
+  packet-size := packet.size
+  if start-pos >= packet-size: throw "TRUNCATED_DNS_NAME"
+
+  first-byte := packet[start-pos]
+  if (first-byte & 0xc0) == 0xc0:
+    if start-pos + 1 >= packet-size: throw "TRUNCATED_DNS_POINTER"
+    target := ((first-byte & 0x3f) << 8) | packet[start-pos + 1]
+    if target < 12 or target >= start-pos: throw "INVALID_DNS_POINTER"
+    if name-cache and name-cache.contains target:
+      reader.skip 2
+      return name-cache[target]
+
+  parts := []
+  pos := start-pos
+  end-pos := -1
+  hops := 0
+  wire-len := 0
+
+  while true:
+    if pos >= packet-size: throw "TRUNCATED_DNS_NAME"
+    len := packet[pos]
+    if len == 0:
+      wire-len += 1
+      if wire-len > MAX-NAME-LENGTH_: throw "DNS_NAME_TOO_LONG"
+      if end-pos == -1: end-pos = pos + 1
+      break
+    if (len & 0xc0) == 0xc0:
+      if pos + 1 >= packet-size: throw "TRUNCATED_DNS_POINTER"
+      target := ((len & 0x3f) << 8) | packet[pos + 1]
+      if target < 12 or target >= pos: throw "INVALID_DNS_POINTER"
+      if end-pos == -1: end-pos = pos + 2
+      hops++
+      if hops > MAX-POINTER-HOPS_: throw "DNS_POINTER_LOOP"
+      if name-cache and name-cache.contains target:
+        cached-suffix/string := name-cache[target]
+        if not cached-suffix.is-empty:
+          wire-len += cached-suffix.size + 2
+          if wire-len > MAX-NAME-LENGTH_: throw "DNS_NAME_TOO_LONG"
+          parts.add cached-suffix
+        else:
+          wire-len += 1
+          if wire-len > MAX-NAME-LENGTH_: throw "DNS_NAME_TOO_LONG"
+        break
+      pos = target
+      continue
+    if len > 63:
+      throw "INVALID_DNS_LABEL"
+    if pos + 1 + len > packet-size: throw "TRUNCATED_DNS_LABEL"
+    wire-len += 1 + len
+    if wire-len > MAX-NAME-LENGTH_: throw "DNS_NAME_TOO_LONG"
+    label := packet[pos + 1 .. pos + 1 + len].to-string-non-throwing
+    if label == "\0": throw "INVALID_DNS_LABEL"
+    parts.add label
+    pos += 1 + len
+
+  reader.skip (end-pos - start-pos)
+  result := parts.join "."
+  if name-cache and start-pos >= 12 and not result.is-empty:
+    name-cache[start-pos] = result
+  return result
+
+/**
+Serializes an mDNS/DNS packet into wire format, supporting standard SDK
+$dns.Resource subclasses as well as $NsecResource and binary/multi-string
+$dns.TxtResource entries.
+*/
+encode-mdns-packet queries/List records/List -> ByteArray
+    --id/int=0
+    --is-response/bool
+    --is-authoritative/bool=false
+    --authorities/List=[]
+    --additionals/List=[]:
+  locations := {:}
+  result := io.Buffer
+  status-bits := is-response ? 0x8000 : 0x0000
+  if is-authoritative: status-bits |= 0x0400
+
+  be := result.big-endian
+  be.write-int16 id
+  be.write-int16 status-bits
+  be.write-int16 queries.size
+  be.write-int16 records.size
+  be.write-int16 authorities.size
+  be.write-int16 additionals.size
+
+  queries.do: | query/dns.Question |
+    write-name_ query.name --locations=locations --buffer=result
+    be.write-int16 query.type
+    clas := dns.CLASS-INTERNET | (query.unicast-ok ? 0x8000 : 0)
+    be.write-int16 clas
+
+  records.do: | record/dns.Resource |
+    write-resource_ record --locations=locations --buffer=result
+  authorities.do: | record/dns.Resource |
+    write-resource_ record --locations=locations --buffer=result
+  additionals.do: | record/dns.Resource |
+    write-resource_ record --locations=locations --buffer=result
+
+  return result.bytes
+
+write-resource_ record/dns.Resource --locations/Map? --buffer/io.Buffer -> none:
+  write-name_ record.name --locations=locations --buffer=buffer
+  be := buffer.big-endian
+  type := record.type
+  be.write-int16 type
+  clas := dns.CLASS-INTERNET | (record.flush ? 0x8000 : 0)
+  be.write-int16 clas
+  be.write-int32 record.ttl
+
+  if record is dns.AResource:
+    bytes := (record as dns.AResource).address.raw
+    be.write-int16 bytes.size
+    buffer.write bytes
+  else if type == dns.RECORD-CNAME or type == dns.RECORD-PTR:
+    str := (record as dns.StringResource).value
+    length := write-name_ str --locations=locations --buffer=null
+    be.write-int16 length
+    write-name_ str --locations=locations --buffer=buffer
+  else if type == dns.RECORD-TXT:
+    if record is dns.TxtResource:
+      txt := record as dns.TxtResource
+      entries := txt.text.is-empty ? [""] : txt.text
+      total-len := 0
+      entries.do: | s |
+        sz := s.size
+        if sz > 255: throw "TXT character-string exceeds 255 octets"
+        total-len += sz + 1
+      be.write-int16 total-len
+      entries.do: | s |
+        buffer.write-byte s.size
+        buffer.write s
+    else:
+      str := (record as dns.StringResource).value
+      if str.size > 255: throw "TXT character-string exceeds 255 octets"
+      be.write-int16 (str.size + 1)
+      buffer.write-byte str.size
+      buffer.write str
+  else if record is dns.SrvResource:
+    srv := record as dns.SrvResource
+    // RFC 6762 §18.14: SRV target MAY be compressed in mDNS, or uncompressed.
+    name-length := write-name_ srv.value --locations=locations --buffer=null
+    be.write-int16 (6 + name-length)
+    be.write-int16 srv.priority
+    be.write-int16 srv.weight
+    be.write-int16 srv.port
+    write-name_ srv.value --locations=locations --buffer=buffer
+  else if record is NsecResource:
+    nsec := record as NsecResource
+    // Write uncompressed next-domain (valid in both multicast mDNS and legacy unicast).
+    name-length := write-name_ nsec.next-domain --locations=null --buffer=null
+    bitmap := encode-nsec-bitmap_ nsec.types
+    be.write-int16 (name-length + bitmap.size)
+    write-name_ nsec.next-domain --locations=null --buffer=buffer
+    buffer.write bitmap
+  else:
+    throw "Unsupported DNS resource type: $type"
+
+encode-nsec-bitmap_ types/List -> ByteArray:
+  max-type := 0
+  types.do: | t/int |
+    if 0 <= t < 256 and t > max-type: max-type = t
+  bm-len := (max-type >> 3) + 1
+  out := ByteArray (2 + bm-len)
+  out[0] = 0  // Window Block 0.
+  out[1] = bm-len
+  types.do: | t/int |
+    if 0 <= t < 256:
+      out[2 + (t >> 3)] |= 0x80 >> (t & 7)
+  return out
+
+write-name_ name/string --locations/Map? --buffer/io.Buffer? -> int:
+  if name.is-empty:
+    if buffer: buffer.write-byte 0
+    return 1
+  parts := name.split "."
+  length := 0
+  pos := 0
+  parts.do: | part/string |
+    if part.size > 63: throw "DNS label exceeds 63 octets: $name"
+    if part.size < 1: throw "Empty DNS label in: $name"
+    tail := name[pos..]
+    tail-key := tail.to-ascii-lower
+    pos += part.size + 1
+    if locations:
+      locations.get tail-key --if-present=: | location/int |
+        if location < 0x3fff:
+          if buffer: buffer.big-endian.write-int16 (location | 0xc000)
+          length += 2
+          if length > MAX-NAME-LENGTH_: throw "DNS name exceeds 255 octets: $name"
+          return length
+    if buffer:
+      if locations and buffer.size < 0x3fff:
+        locations[tail-key] = buffer.size
+      buffer.write-byte part.size
+      buffer.write part
+    length += part.size + 1
+    if length >= MAX-NAME-LENGTH_: throw "DNS name exceeds 255 octets: $name"
+  if buffer: buffer.write-byte 0
+  return length + 1
+
+/**
 Case-insensitive comparison of DNS names per RFC 6762 §16.
 
-ASCII letters in `a..z` (0x61..0x7A) match their uppercase equivalents
-in `A..Z` (0x41..0x5A). All other bytes (including UTF-8 multi-byte
-sequences) are compared by binary equality.
-
-This is used everywhere the implementation compares DNS names, since
-`MyHost.local`, `myhost.local`, and `MYHOST.LOCAL` must all be treated
-as the same name.
+ASCII letters in `a..z` match their uppercase equivalents in `A..Z`.
+All other bytes (including UTF-8 multi-byte sequences) are compared by
+binary equality without heap allocation.
 */
 name-equals a/string b/string -> bool:
   if identical a b: return true
@@ -153,21 +433,33 @@ name-equals a/string b/string -> bool:
     ca := a.at --raw i
     cb := b.at --raw i
     if ca == cb: continue
-    // Lowercase ASCII letters; leave everything else as-is.
     if 'A' <= ca <= 'Z': ca += 'a' - 'A'
     if 'A' <= cb <= 'Z': cb += 'a' - 'A'
     if ca != cb: return false
   return true
 
 /**
-Validates that a decoded packet conforms to mDNS header requirements.
+Truncates $s to at most $max-bytes octets without splitting a UTF-8 rune.
+*/
+truncate-utf8 s/string max-bytes/int -> string:
+  if s.size <= max-bytes: return s
+  end := max-bytes
+  // Step back over UTF-8 continuation bytes (0b10xxxxxx) so we never split a rune.
+  while end > 0 and ((s.at --raw end) & 0xc0) == 0x80:
+    end--
+  return s[..end]
 
-RFC 6762 §18.3: OPCODE MUST be zero; messages with non-zero OPCODE
-  MUST be silently ignored.
-RFC 6762 §18.11: RCODE MUST be zero; messages with non-zero RCODE
-  MUST be silently ignored.
+/**
+Returns true if $name has a non-empty prefix followed by `.local`
+(matched case-insensitively per RFC 6762 §16).
+*/
+has-local-suffix name/string -> bool:
+  if name.size <= 6: return false
+  return name-equals name[name.size - 6..] ".local"
 
-Returns true if the packet is valid and should be processed.
+/**
+Validates that a decoded packet conforms to mDNS header requirements
+(RFC 6762 §18.3 `OPCODE == 0` and §18.11 `RCODE == 0`).
 */
 is-valid-mdns-message packet/dns.DecodedPacket -> bool:
   if packet.opcode != 0: return false
@@ -180,73 +472,99 @@ is-query-for packet/dns.DecodedPacket name/string -> bool:
   return packet.questions.any: name-equals it.name name
 
 /**
-Checks if a query contains known answers that suppress our response.
+Checks if two resources represent the same `(name, type, rdata)` tuple,
+ignoring `ttl` and `flush` bits.
 
-RFC 6762 §7.1: "A Multicast DNS responder MUST NOT answer a Multicast
-  DNS query if the answer it would give is already included in the
-  Answer Section with an RR TTL at least half the correct value."
-
-The $type parameter specifies the record type to match (e.g.
-  $dns.RECORD-A, $dns.RECORD-PTR).
-The optional $data parameter, when provided, additionally matches
-  against the string value of PTR/CNAME records to avoid suppressing
-  responses for a different service instance sharing the same
-  type-domain.
-
-Returns true if the query's Known-Answer Section already contains
-  a matching record with ≥ 50% of our TTL, meaning we should suppress.
+DNS domain names (`owner`, `PTR`/`CNAME`/`SRV`/`NSEC` targets) are compared
+case-insensitively per RFC 6762 §16; `TXT` character-strings are compared
+case-sensitively per RFC 6763 §6.4.
 */
-has-known-answer query/dns.DecodedPacket name/string type/int our-ttl/int
-    --data/string?=null
-    --record/dns.Resource?=null -> bool:
-  query.resources.do: | res |
-    if (name-equals res.name name) and res.type == type and res.ttl >= (our-ttl / 2):
-      if record:
-        if resource-data-matches_ res record: return true
-        continue.do
-      if data == null: return true
-      // For PTR/CNAME records, also verify the string data matches
-      // our specific instance.
-      if (res is dns.StringResource) and
-          name-equals (res as dns.StringResource).value data:
-        return true
-  return false
+resource-equals a/dns.Resource b/dns.Resource -> bool:
+  if a.type != b.type: return false
+  if not name-equals a.name b.name: return false
+  return resource-rdata-matches_ a b
 
-resource-data-matches_ actual/dns.Resource expected/dns.Resource -> bool:
-  if actual.type != expected.type: return false
-  if not name-equals actual.name expected.name: return false
+resource-rdata-matches_ actual/dns.Resource expected/dns.Resource -> bool:
   if actual is dns.AResource and expected is dns.AResource:
     return (actual as dns.AResource).address == (expected as dns.AResource).address
   if actual is dns.SrvResource and expected is dns.SrvResource:
     actual-srv := actual as dns.SrvResource
     expected-srv := expected as dns.SrvResource
     return actual-srv.priority == expected-srv.priority and
-      actual-srv.weight == expected-srv.weight and
-      actual-srv.port == expected-srv.port and
-      (name-equals actual-srv.value expected-srv.value)
+        actual-srv.weight == expected-srv.weight and
+        actual-srv.port == expected-srv.port and
+        (name-equals actual-srv.value expected-srv.value)
+  if actual is dns.TxtResource and expected is dns.TxtResource:
+    ta := (actual as dns.TxtResource).text
+    tb := (expected as dns.TxtResource).text
+    if ta.size != tb.size: return false
+    ta.size.repeat: | i |
+      if ta[i] != tb[i]: return false
+    return true
   if actual is dns.StringResource and expected is dns.StringResource:
-    return name-equals (actual as dns.StringResource).value (expected as dns.StringResource).value
+    sa := (actual as dns.StringResource).value
+    sb := (expected as dns.StringResource).value
+    if actual.type == dns.RECORD-TXT:
+      return sa == sb
+    return name-equals sa sb
+  if actual is NsecResource and expected is NsecResource:
+    na := actual as NsecResource
+    nb := expected as NsecResource
+    if not name-equals na.next-domain nb.next-domain: return false
+    if na.types.size != nb.types.size: return false
+    return na.types.every: nb.types.contains it
   return false
 
 /**
-Checks if a packet is an authoritative response for a specific name.
+Checks if a query contains known answers that suppress our response
+(RFC 6762 §7.1: suppress when matching RR has TTL >= 50% of $our-ttl).
+*/
+has-known-answer query/dns.DecodedPacket name/string type/int our-ttl/int
+    --data/string?=null
+    --record/dns.Resource?=null -> bool:
+  half-ttl := our-ttl / 2
+  query.resources.do: | res/dns.Resource |
+    if (name-equals res.name name) and res.type == type and res.ttl >= half-ttl:
+      if record:
+        if resource-rdata-matches_ res record: return true
+        continue.do
+      if data == null: return true
+      if (res is dns.StringResource) and
+          name-equals (res as dns.StringResource).value data:
+        return true
+  return false
 
-Used for conflict detection - if we receive an authoritative response
-for our claimed hostname from another device, we must either defend
-or rename.
+/**
+Checks if a packet is a positive response carrying records for $name.
+
+Per RFC 6762 §18.4, the `AA` header bit MUST be ignored on reception.
+Per RFC 6762 §9, conflicting records may appear in any response section
+(Answer, Authority, or Additional). Goodbye records (`TTL == 0`) release
+ownership rather than claiming it and are excluded.
 */
 is-authoritative-response-for packet/dns.DecodedPacket name/string -> bool:
   if not packet.is-response: return false
-  if not packet.is-authoritative: return false
-  // Check answers for the name.
-  return packet.resources.any: name-equals it.name name
+  if packet.resources.any (: | r/dns.Resource | r.ttl > 0 and (name-equals r.name name)):
+    return true
+  if packet.additionals.any (: | r/dns.Resource | r.ttl > 0 and (name-equals r.name name)):
+    return true
+  return packet.authorities.any: | r/dns.Resource | r.ttl > 0 and (name-equals r.name name)
 
 /**
-Checks if a packet is a probe query for a specific name.
+Iterates all positive (`TTL > 0`) records matching $name across the Answer,
+Additional, and Authority sections of a response $packet.
+*/
+do-response-records-for packet/dns.DecodedPacket name/string [block] -> none:
+  if not packet.is-response: return
+  packet.resources.do: | r/dns.Resource |
+    if r.ttl > 0 and (name-equals r.name name): block.call r
+  packet.additionals.do: | r/dns.Resource |
+    if r.ttl > 0 and (name-equals r.name name): block.call r
+  packet.authorities.do: | r/dns.Resource |
+    if r.ttl > 0 and (name-equals r.name name): block.call r
 
-A probe is a query (not a response) that has records in the Authority
-Section. Per RFC 6762 Section 8.2, probers include their proposed
-records in the Authority Section for tiebreaking.
+/**
+Checks if a packet is a probe query for a specific name (RFC 6762 §8.2).
 */
 is-probe-for packet/dns.DecodedPacket name/string -> bool:
   if packet.is-response: return false
@@ -254,10 +572,7 @@ is-probe-for packet/dns.DecodedPacket name/string -> bool:
   return packet.questions.any: name-equals it.name name
 
 /**
-Extracts A record addresses from the Authority Section for a given name.
-
-Returns the list of $net.IpAddress values proposed in the probe's
-Authority Section for tiebreaking comparison.
+Extracts A/AAAA record addresses from the Authority Section for $name.
 */
 get-authority-addresses packet/dns.DecodedPacket name/string -> List:
   result := []
@@ -267,23 +582,80 @@ get-authority-addresses packet/dns.DecodedPacket name/string -> List:
   return result
 
 /**
-Compares two IP addresses lexicographically by raw bytes.
-
-Returns:
-  - A positive number if $a is lexicographically later (a wins).
-  - A negative number if $b is lexicographically later (b wins).
-  - 0 if they are identical.
-
-Per RFC 6762 Section 8.2, bytes are compared as unsigned 8-bit values.
+Compares two IP addresses lexicographically by raw unsigned bytes (RFC 6762 §8.2).
 */
 compare-addresses a/net.IpAddress b/net.IpAddress -> int:
-  a-bytes := a.raw
-  b-bytes := b.raw
-  // Compare raw bytes pairwise as unsigned values, then by length.
-  // When one address is IPv4 (4 bytes) and the other is IPv6 (16 bytes),
-  // the shorter one is considered "earlier" after the shared prefix.
-  min-len := min a-bytes.size b-bytes.size
-  for i := 0; i < min-len; i++:
-    diff := a-bytes[i] - b-bytes[i]
+  return compare-bytes_ a.raw b.raw
+
+/**
+Performs RFC 6762 §8.2.1 simultaneous-probe tiebreaking for $name.
+
+Compares $our-records against the records for $name in $authority-records
+after sorting both sets by `(rrclass, rrtype, canonical_uncompressed_rdata)`.
+
+Returns:
+- `null` if $authority-records contains no records for $name.
+- A positive integer if we win (`our > their`).
+- A negative integer if we lose (`our < their`).
+- `0` if both record sets are identical (e.g. multicast loopback of our own probe).
+*/
+compare-probe-tiebreak our-records/List authority-records/List name/string -> int?:
+  their-encoded := []
+  authority-records.do: | res/dns.Resource |
+    if name-equals res.name name:
+      their-encoded.add (canonical-tiebreak-entry_ res)
+  if their-encoded.is-empty: return null
+
+  our-encoded := our-records.map: | res/dns.Resource | canonical-tiebreak-entry_ res
+  our-encoded.sort --in-place: | a b | compare-tiebreak-entry_ a b
+  their-encoded.sort --in-place: | a b | compare-tiebreak-entry_ a b
+
+  pair-count := min our-encoded.size their-encoded.size
+  pair-count.repeat: | i |
+    diff := compare-tiebreak-entry_ our-encoded[i] their-encoded[i]
     if diff != 0: return diff
-  return a-bytes.size - b-bytes.size
+  return our-encoded.size - their-encoded.size
+
+canonical-tiebreak-entry_ res/dns.Resource -> List:
+  buf := io.Buffer
+  be := buf.big-endian
+  if res is dns.AResource:
+    buf.write (res as dns.AResource).address.raw
+  else if res is dns.SrvResource:
+    srv := res as dns.SrvResource
+    be.write-int16 srv.priority
+    be.write-int16 srv.weight
+    be.write-int16 srv.port
+    write-name_ srv.value.to-ascii-lower --locations=null --buffer=buf
+  else if res is dns.TxtResource:
+    txt := res as dns.TxtResource
+    entries := txt.text.is-empty ? [""] : txt.text
+    entries.do: | s |
+      buf.write-byte s.size
+      buf.write s
+  else if res is dns.StringResource:
+    str := (res as dns.StringResource).value
+    if res.type == dns.RECORD-PTR or res.type == dns.RECORD-CNAME:
+      write-name_ str.to-ascii-lower --locations=null --buffer=buf
+    else:
+      buf.write-byte str.size
+      buf.write str
+  else if res is NsecResource:
+    nsec := res as NsecResource
+    write-name_ nsec.next-domain.to-ascii-lower --locations=null --buffer=buf
+    buf.write (encode-nsec-bitmap_ nsec.types)
+  return [dns.CLASS-INTERNET, res.type, buf.bytes]
+
+compare-tiebreak-entry_ a/List b/List -> int:
+  class-diff := (a[0] as int) - (b[0] as int)
+  if class-diff != 0: return class-diff
+  type-diff := (a[1] as int) - (b[1] as int)
+  if type-diff != 0: return type-diff
+  return compare-bytes_ (a[2] as ByteArray) (b[2] as ByteArray)
+
+compare-bytes_ a/ByteArray b/ByteArray -> int:
+  min-len := min a.size b.size
+  for i := 0; i < min-len; i++:
+    diff := a[i] - b[i]
+    if diff != 0: return diff
+  return a.size - b.size

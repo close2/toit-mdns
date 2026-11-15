@@ -1,72 +1,29 @@
 /**
-mDNS state management and RFC 6762 compliant announcement.
+mDNS state management and RFC 6762 / RFC 6763 compliant responder.
 
 Manages the lifecycle of hostname claims and service registrations through
-a three-state machine: PROBING → ANNOUNCING → ESTABLISHED.
-
-# Probing Phase (RFC 6762 Section 8.1)
-
-Before claiming a hostname, we send probe queries to detect conflicts.
-If no response in 250ms × 3 attempts, we consider the name available.
-If another device responds, we rename and restart probing.
-
-# Announcing Phase (RFC 6762 Section 8.3)
-
-After successful probing, we announce our records as authoritative.
-The announcement includes A records for our hostname and SRV/TXT/PTR
-records for any registered services.
-
-# Conflict Defense (RFC 6762 Section 9)
-
-Once established, if another device claims our name, we defend it by
-re-announcing. If conflicts persist (>3 in 10 seconds), we rename to
-avoid endless conflicts with a misbehaving device.
-
-# Unicast Response Support
-
-When queries have the QU (Query Unicast) bit set, we respond directly
-to the querier's IP address to reduce multicast traffic.
+a three-state machine: `PROBING -> ANNOUNCING -> ESTABLISHED`.
 */
 
+import log
 import net
 import net.modules.dns
-import ..net.mdns_socket
-import ..net.dns_helper as dns
-import .conflict_manager
-import log
+import ..net.mdns-socket
+import ..net.dns-helper as dns
+import .conflict-manager
+
+class DeferredRecord_:
+  record/dns.Resource
+  rate-key/string
+  due-us/int
+
+  constructor .record .rate-key .due-us:
 
 /**
-  mDNS state machine managing hostname claims and service announcements.
-  
-  Handles probing, conflict detection/defense, and query responses per
-  RFC 6762 requirements.
-
-  # State Diagram
-  ```
-        [ Start ]
-            |
-            v
-        +---------+
-        | PROBING |<--------------------------+
-        +---------+                           |
-            |                                 |
-            | 3 successful probes             |
-            v                                 |
-        +------------+                        |
-        | ANNOUNCING |                        |
-        +------------+                        |
-            |                                 |
-            | Send unsolicited announcement   | Persistent Conflict
-            v                                 | (Rename)
-       +-------------+                        |
-   +---| ESTABLISHED |------------------------+
-   |   +-------------+
-   |          ^
-   | Conflict |
-   | (Defend) |
-   +----------+
-  ```
-  */
+mDNS state machine managing hostname claims, service announcements,
+conflict defense, restricted-form `NSEC` negative responses, and
+rate-limited / deferred multicast transmission.
+*/
 class StateManager:
   /// Currently probing for name availability.
   static STATE-PROBING ::= 0
@@ -75,95 +32,104 @@ class StateManager:
   /// Stable state, responding to queries and defending name.
   static STATE-ESTABLISHED ::= 2
 
+  static CONFLICT-RATE-LIMIT-THRESHOLD_ ::= 15
+  static CONFLICT-RATE-LIMIT-WINDOW-US_ ::= 10_000_000  // 10 seconds.
+  static CONFLICT-RATE-LIMIT-DELAY-MS_ ::= 5_000        // 5 seconds.
+
+  /// Per-record multicast rate limit (RFC 6762 §6: at most once per second).
+  static MULTICAST-RATE-LIMIT-WINDOW-US_ ::= 1_000_000
+  /// Probe-defense rate limit exception (RFC 6762 §6: at most once per 250ms).
+  static PROBE-DEFENSE-RATE-LIMIT-US_ ::= 250_000
+  /// Quarter of longest emitted TTL (4500s / 4), used for RFC 6762 §5.4 QU decisions.
+  static MAX-QU-MULTICAST-WINDOW-US_ ::= 4500 * 250_000
+  /// Upper bound on queued deferred multicast records.
+  static MAX-DEFERRED-RECORDS_ ::= 64
+
   state_/int := STATE-PROBING
-  socket_/MdnsSocket
+  socket_/MdnsSocket := ?
   conflict-manager_/ConflictManager
-  local-ip_/net.IpAddress
-  hostname_/string := ? // Mutable
-  expected-port_/int  // RFC 6762 §6.10: port we validate responses from.
-  
-  probe-count_ := 0
+  local-ip_/net.IpAddress := ?
+  hostname_/string := ?
+  expected-port_/int
+
+  probe-count_/int := 0
   probe-timer_/Task? := null
-  // Generation counter: bumped every time we (re)enter probing.  An
-  // in-flight probe task that loses its slot to a newer one detects this
-  // and exits without doing extra work.  Cancellation eventually fires
-  // at the task's next yield, but it doesn't preempt synchronous code,
-  // so we still need this guard to prevent stale iterations from
-  // sending probes or transitioning to ANNOUNCING.
   probe-generation_/int := 0
   first-probe-sent_/bool := false
   stopped_/bool := false
-  
-  // Conflict defense counters
-  defend-count_ := 0
-  last-defend-time_ := 0
 
-  // RFC 6762 §8.1: After 15 rapid conflicts, rate-limit probing.
-  conflict-count_ := 0
-  conflict-window-start_ := 0
-  static CONFLICT-RATE-LIMIT-THRESHOLD_ ::= 15
-  static CONFLICT-RATE-LIMIT-WINDOW-US_ ::= 10_000_000  // 10 seconds.
-  static CONFLICT-RATE-LIMIT-DELAY-MS_ ::= 5_000  // 5 seconds.
+  defend-count_/int := 0
+  last-defend-time_/int := 0
 
-  // RFC 6762 §6: "A Multicast DNS responder MUST NOT multicast the
-  //   same resource record on a given interface more frequently than
-  //   once per second."
-  // Tracked per record (name+type) as the RFC requires.
-  last-multicast-times_ := {:}  // Map<string, int> — "name:type" → monotonic-us
+  conflict-count_/int := 0
+  conflict-window-start_/int := 0
 
-  services_/List := [] // List<RegisteredService>
+  last-multicast-times_/Map := {:}  // rate-key -> monotonic-us
+  deferred-multicast_/Map := {:}    // rate-key -> DeferredRecord_
+  deferred-send-task_/Task? := null
+  deferred-wakeup-us_/int := 0
 
-  /**
-  Number of registered services.  Exposed for tests.
-  */
+  services_/List := []  // List<RegisteredService>
+
+  /** Number of registered services. Exposed for tests. */
   services-count -> int:
     return services_.size
 
   /**
-  Creates a new StateManager.
-  The [hostname] must end with ".local".
-  The [expected-port] defaults to 5353 per RFC 6762 §6.10.
+  Creates a new $StateManager.
+  The $hostname must end with `.local` (case-insensitive).
   */
   constructor .socket_ .conflict-manager_ hostname/string .local-ip_ --expected-port/int=5353:
-    assert: hostname.ends-with ".local"
+    assert: dns.has-local-suffix hostname
     hostname_ = hostname
     expected-port_ = expected-port
-  
-  /**
-  Registers a service to be announced.
-  The [type] should be a service type like "_http._tcp".
-  The [port] is the port the service is running on.
-  The [txt] map contains TXT record key-value pairs.
-  The [name] is the instance name. If null, it defaults to the hostname (without .local).
 
-  # Examples
-  ```
-  state-manager.register-service "_http._tcp" 8080 --txt={"path": "/"}
-  ```
+  /**
+  Updates the socket and local IP after a network interface recovery and
+  restarts probing per RFC 6762 §8.1.
+  */
+  update-network socket/MdnsSocket local-ip/net.IpAddress -> none:
+    socket_ = socket
+    local-ip_ = local-ip
+    cancel-deferred-multicast_
+    if not stopped_: enter-probing_
+
+  /**
+  Registers a DNS-SD service to be probed and announced.
   */
   register-service type/string port/int -> none
       --txt/Map?=null
       --name/string?=null:
-    // Default name to hostname (without .local) if null.
     instance-name := name or (hostname_.copy 0 hostname_.size - 6)
-    // Dedup: a client that re-registers the same (type, instance-name)
-    // tuple — for example after a WiFi reconnect — must not produce a
-    // duplicate entry in $services_.  Replace the existing entry in
-    // place if any of its mutable fields changed; otherwise treat the
-    // call as a no-op so we don't restart the probing cycle for free.
+    // Dedup across reconnects: match both original-instance-name and the
+    // conflict-renamed instance-name so re-registering after a rename keeps
+    // the conflict-resolved name stable without duplicating entries.
     services_.size.repeat: | i |
       existing/RegisteredService := services_[i]
-      if existing.type == type and existing.instance-name == instance-name:
+      if (dns.name-equals existing.type type) and
+          (existing.original-instance-name == instance-name or existing.instance-name == instance-name):
         if existing.port == port and (txt-equals_ existing.txt txt): return
-        services_[i] = RegisteredService type instance-name port txt
+        services_[i] = RegisteredService type existing.original-instance-name existing.instance-name port txt
         enter-probing_
         return
-    services_.add (RegisteredService type instance-name port txt)
-    // RFC 6762 §8: a newly added record must go through probing too.
-    // Restart the probing cycle unconditionally so the new service gets
-    // the full three probes; if we are already probing, a partially
-    // completed cycle would otherwise leave the new service under-probed.
+    services_.add (RegisteredService type instance-name instance-name port txt)
     enter-probing_
+
+  /**
+  Unregisters a previously registered service, sending voluntary `TTL=0`
+  goodbye records if currently announcing or established.
+  */
+  unregister-service type/string --name/string?=null -> bool:
+    target-name := name or (hostname_.copy 0 hostname_.size - 6)
+    for i := 0; i < services_.size; i++:
+      s/RegisteredService := services_[i]
+      if (dns.name-equals s.type type) and
+          (s.original-instance-name == target-name or s.instance-name == target-name):
+        services_.remove --at=i
+        if not stopped_ and (state_ == STATE-ANNOUNCING or state_ == STATE-ESTABLISHED):
+          send-service-goodbye_ s
+        return true
+    return false
 
   static txt-equals_ a/Map? b/Map? -> bool:
     if identical a b: return true
@@ -174,85 +140,69 @@ class StateManager:
       if b[key] != value: return false
     return true
 
-  /**
-  Starts the state machine. Begins by entering the probing phase.
-  */
-  start:
+  /** Starts the state machine by entering the probing phase. */
+  start -> none:
+    stopped_ = false
     enter-probing_
 
   /**
-  Stops the probing/announcing process and cancels any pending timers.
-
-  Cancelling the background task causes a $CANCELED-ERROR at its next
-  yield point (sleep or monitor await), which propagates through any
-  $catch blocks and runs the task's finally clause — this is Toit's
-  standard cooperative cancellation mechanism.
+  Stops probing/announcing, cancels background tasks, and sends voluntary
+  `TTL=0` goodbye records (RFC 6762 §10.1) if ownership was announced.
   */
-  stop:
+  stop -> none:
+    if stopped_: return
+    was-announced := state_ == STATE-ANNOUNCING or state_ == STATE-ESTABLISHED
     stopped_ = true
-    if probe-timer_: 
+    probe-generation_++
+    if probe-timer_:
       probe-timer_.cancel
       probe-timer_ = null
+    cancel-deferred-multicast_
+    if was-announced:
+      send-goodbye_
 
   /**
-  Updates the hostname.
-  If the hostname changes, it restarts the probing process for the new name.
-  The [new-hostname] must end with ".local".
+  Updates the hostname and restarts probing if it changed.
   */
   set-hostname new-hostname/string -> none:
-    assert: new-hostname.ends-with ".local"
-    if hostname_ == new-hostname: return
+    assert: dns.has-local-suffix new-hostname
+    if dns.name-equals hostname_ new-hostname: return
+    if not stopped_ and (state_ == STATE-ANNOUNCING or state_ == STATE-ESTABLISHED):
+      send-host-goodbye_ hostname_
     hostname_ = new-hostname
-    // Restart probing for the new name
+    cancel-deferred-multicast_
     enter-probing_
 
   /**
-  Processes an incoming mDNS packet.
-  Called from the service for every packet.
-  Triggers conflict detection/defense or query responses.
+  Processes an incoming mDNS packet for conflict detection, tiebreaking,
+  and query responses.
   */
-  process-packet decoded/dns.DecodedPacket --source/net.SocketAddress?=null:
-    // RFC 6762 §18.3, §18.11: Reject non-zero OPCODE or RCODE.
+  process-packet decoded/dns.DecodedPacket --source/net.SocketAddress?=null -> none:
+    if stopped_: return
     if not dns.is-valid-mdns-message decoded: return
 
     // RFC 6762 §6.10: Reject responses not from the expected mDNS port.
     if decoded.is-response and source:
       if source.port != expected-port_: return
 
-    // --- Simultaneous Probe Tiebreaking (RFC 6762 Section 8.2) ---
-    // If we're probing and we see another probe for the same name,
-    // compare our proposed rdata with theirs lexicographically.
+    // --- Simultaneous Probe Tiebreaking (RFC 6762 §8.2) ---
     if state_ == STATE-PROBING and dns.is-probe-for decoded hostname_:
-      their-addrs := dns.get-authority-addresses decoded hostname_
-      if not their-addrs.is-empty:
-        // Compare our IP against each of their proposed IPs.
-        // Per RFC 6762, the lexicographically later rdata wins.
-        we-lose := their-addrs.any: | their-ip/net.IpAddress |
-          (dns.compare-addresses local-ip_ their-ip) < 0
-        if we-lose:
-          // We lose the tiebreak. Wait 1 second, then re-probe.
-          // (The other host will complete probing and claim the name;
-          // when we re-probe, we'll see their response and rename.)
-          log.info "Probe tiebreak lost, deferring" --tags={"hostname": hostname_}
-          if probe-timer_: probe-timer_.cancel
-          probe-timer_ = task::
-            try:
-              sleep (Duration --s=1)
-              enter-probing_
-            finally:
-              if probe-timer_ == Task.current: probe-timer_ = null
-          return
+      our-host-records := [dns.AResource hostname_ 120 local-ip_]
+      cmp := dns.compare-probe-tiebreak our-host-records decoded.authorities hostname_
+      if cmp != null and cmp < 0:
+        log.info "Probe tiebreak lost, deferring" --tags={"hostname": hostname_}
+        defer-probing-one-second_
+        return
 
-    // --- Conflict detection from authoritative responses ---
-    // RFC 6762 §8.5: Responses received *before* the first probe
-    // packet is sent MUST be silently ignored.
+    // RFC 6762 §8.5: Responses received before the first probe packet is
+    // sent MUST be silently ignored.
     if state_ == STATE-PROBING and not first-probe-sent_: return
 
+    // --- Hostname conflict detection across all response sections (RFC 6762 §9) ---
     if dns.is-authoritative-response-for decoded hostname_:
-      // Check if RData is different (RFC 6762 Section 9)
       is-conflict := false
-      decoded.resources.do: | res |
-        if (dns.name-equals res.name hostname_) and res is dns.AResource:
+      dns.do-response-records-for decoded hostname_: | res/dns.Resource |
+        if res is dns.AResource:
           addr := (res as dns.AResource).address
           if addr != local-ip_:
             is-conflict = true
@@ -260,68 +210,60 @@ class StateManager:
       if is-conflict:
         if state_ == STATE-PROBING:
           handle-probing-conflict_
+          return
         else if state_ == STATE-ANNOUNCING or state_ == STATE-ESTABLISHED:
-          // RFC 6762 §9: conflict resolution applies any time after
-          // probing succeeds.  ANNOUNCING is a window where ignoring a
-          // conflict would let two responders briefly believe they own
-          // the name.
           handle-established-conflict_
+          if state_ == STATE-PROBING: return
 
-    // --- Service-instance conflict detection (RFC 6762 §8 / §9). ---
-    // Hostnames are unique per device, but two devices that pick the
-    // same DNS-SD service instance name (e.g. "Nebenuhr._http._tcp.local")
-    // would both register conflicting SRV/TXT records. RFC 6762 §8.1
-    // requires probing for *every* unique record; §9 requires conflict
-    // defense or rename for those records throughout the lifetime of
-    // the responder. We mirror the hostname logic for each service.
+    // --- Service-instance tiebreaking & conflict detection (RFC 6762 §8 / §9) ---
     services_.size.repeat: | i |
       s/RegisteredService := services_[i]
       if state_ == STATE-PROBING and dns.is-probe-for decoded s.full-name:
-        // Tiebreak using the SRV target (our hostname vs theirs).  Two
-        // probers with the same instance name necessarily have
-        // different hostnames after hostname-conflict resolution, so
-        // a lexicographic comparison of the SRV target deterministically
-        // chooses one winner (avoids the symmetric-defer livelock that
-        // would arise from blindly renaming on every probe collision).
-        their-targets := get-authority-srv-targets_ decoded s.full-name
-        if not their-targets.is-empty:
-          we-lose := their-targets.any: | their-target/string |
-            (compare-names_ hostname_ their-target) < 0
-          if we-lose:
-            log.info "Service-instance probe lost, renaming"
-                --tags={"service": s.full-name}
-            handle-service-conflict_ i
-            return
-      if dns.is-authoritative-response-for decoded s.full-name:
-        is-srv-conflict := false
-        decoded.resources.do: | res |
-          if (dns.name-equals res.name s.full-name) and res is dns.SrvResource:
-            target := (res as dns.SrvResource).value
-            if not (dns.name-equals target hostname_):
-              is-srv-conflict = true
-        if is-srv-conflict:
-          log.warn "Service-instance conflict, renaming"
-              --tags={"service": s.full-name}
+        our-srv-records := [
+          dns.SrvResource s.full-name dns.RECORD-SRV 120 false hostname_ 0 0 s.port,
+          dns.TxtResource s.full-name 4500 false (build-txt-list_ s.txt),
+        ]
+        cmp := dns.compare-probe-tiebreak our-srv-records decoded.authorities s.full-name
+        if cmp != null and cmp < 0:
+          log.info "Service-instance probe lost, renaming" --tags={"service": s.full-name}
           handle-service-conflict_ i
           return
+      if dns.is-authoritative-response-for decoded s.full-name:
+        is-srv-conflict := false
+        dns.do-response-records-for decoded s.full-name: | res/dns.Resource |
+          if res is dns.SrvResource:
+            srv := res as dns.SrvResource
+            if not (dns.name-equals srv.value hostname_) or srv.port != s.port:
+              is-srv-conflict = true
+        if is-srv-conflict:
+          if state_ == STATE-PROBING:
+            handle-service-conflict_ i
+            return
+          else if state_ == STATE-ANNOUNCING or state_ == STATE-ESTABLISHED:
+            handle-established-service-conflict_ i
+            if state_ == STATE-PROBING: return
 
     if state_ != STATE-ANNOUNCING and state_ != STATE-ESTABLISHED: return
 
-    // RFC 6762: a single query packet may contain multiple questions
-    // for both the hostname and one or more registered services. We
-    // must produce a single response packet that aggregates all the
-    // answers — calling send-response_ once is enough, and avoids
-    // emitting duplicate responses on the wire.
-    if has-relevant-question_ decoded:
+    if not decoded.is-response and (has-relevant-question_ decoded):
       send-response_ decoded --source=source
 
-  /**
-  Returns true if the query packet contains at least one question that
-  this state manager owns an answer for.
-  */
+  defer-probing-one-second_ -> none:
+    probe-generation_++
+    probe-count_ = 0
+    first-probe-sent_ = false
+    my-generation := probe-generation_
+    if probe-timer_: probe-timer_.cancel
+    probe-timer_ = task::
+      try:
+        sleep (Duration --s=1)
+        if not stopped_ and probe-generation_ == my-generation:
+          enter-probing_
+      finally:
+        if probe-timer_ == Task.current: probe-timer_ = null
+
   has-relevant-question_ query/dns.DecodedPacket -> bool:
     if dns.is-query-for query hostname_: return true
-    // Snapshot size to be safe against concurrent register-service.
     n := services_.size
     n.repeat: | i |
       s/RegisteredService := services_[i]
@@ -329,28 +271,20 @@ class StateManager:
       if dns.is-query-for query s.type-domain: return true
     return dns.is-query-for query "_services._dns-sd._udp.local"
 
-  enter-probing_:
+  enter-probing_ -> none:
     if stopped_: return
-    // 1. Critical: Update state synchronously to prevent re-entry
     state_ = STATE-PROBING
     probe-count_ = 0
     first-probe-sent_ = false
-    defend-count_ = 0 // Reset defense count
-    // Bump the generation so any in-flight probe task from a previous
-    // call exits at its next loop iteration even before its
-    // CANCELED-ERROR fires.
+    defend-count_ = 0
     probe-generation_++
+    cancel-deferred-multicast_
 
     if probe-timer_: probe-timer_.cancel
 
-    // 2. Start the probing loop in a task.
-    //    Cancellation (from $stop or a new call to $enter-probing_) fires
-    //    at the next sleep, propagating through catch as CANCELED-ERROR.
     my-generation := probe-generation_
     probe-timer_ = task::
       try:
-        // RFC 6762 §8.7: After 15 conflicts in 10 seconds,
-        // wait at least 5 seconds before each successive attempt.
         now := Time.monotonic-us
         if now - conflict-window-start_ > CONFLICT-RATE-LIMIT-WINDOW-US_:
           conflict-count_ = 0
@@ -359,10 +293,7 @@ class StateManager:
           log.warn "Rate limiting: too many conflicts" --tags={"count": conflict-count_}
           sleep (Duration --ms=CONFLICT-RATE-LIMIT-DELAY-MS_)
 
-        // RFC 6762 Section 8.1: Random delay of 0-250ms before first
-        // probe to reduce probability of simultaneous probes from
-        // devices that power on at the same time.
-        jitter-ms := random 251  // 0..250 inclusive
+        jitter-ms := random 251
         sleep (Duration --ms=jitter-ms)
 
         while not stopped_
@@ -374,207 +305,192 @@ class StateManager:
           send-probe_
           sleep (Duration --ms=250)
 
-        // Only the most recent probe generation may transition to
-        // ANNOUNCING.  Otherwise an old, lingering task could announce
-        // for a hostname that has since been replaced.
         if not stopped_
             and probe-generation_ == my-generation
             and state_ == STATE-PROBING:
           enter-announcing_ my-generation
       finally:
-        // If enter-probing_ was called again (e.g. because of a rename),
-        // it cancelled this task and started a new one (updating probe-timer_).
-        // We must ensure we don't null out the new timer.
         if probe-timer_ == Task.current: probe-timer_ = null
 
-  handle-probing-conflict_:
+  handle-probing-conflict_ -> none:
     if probe-timer_: probe-timer_.cancel
-    conflict-count_++
-    // Pick a new name and restart probing
-    new-name := conflict-manager_.resolve-probing-conflict hostname_
-    hostname_ = new-name
+    record-conflict_
+    hostname_ = conflict-manager_.resolve-probing-conflict hostname_
     enter-probing_
 
-  handle-established-conflict_:
-    // RFC 6762 Section 9: Defend the name by sending a response.
-    // If we see more than a few conflicts in a short period (e.g. 10s), we must back off.
-    
+  handle-established-conflict_ -> none:
     now := Time.monotonic-us
-    
-    // If it's been more than 10 seconds since last defense, reset counter.
     if now - last-defend-time_ > 10_000_000:
       defend-count_ = 0
-    
+
     if defend-count_ < 3:
       log.warn "Defending name" --tags={"hostname": hostname_}
       defend-count_++
       last-defend-time_ = now
-      send-announcement_ // Re-announce to assert authority
+      send-defense_
     else:
       log.warn "Conflict persistence detected. Renaming..." --tags={"hostname": hostname_}
-      new-name := conflict-manager_.resolve-established-conflict hostname_
-      hostname_ = new-name
+      record-conflict_
+      hostname_ = conflict-manager_.resolve-established-conflict hostname_
       enter-probing_
 
-  /**
-  Renames the service at index $i in $services_ via $conflict-manager_
-  and re-enters probing so the new name is verified before being
-  announced.  Used for service-instance conflicts (RFC 6762 §8 / §9).
-  */
   handle-service-conflict_ i/int -> none:
+    record-conflict_
     s/RegisteredService := services_[i]
     new-instance := conflict-manager_.resolve-probing-conflict s.instance-name
-    services_[i] = RegisteredService s.type new-instance s.port s.txt
+    services_[i] = RegisteredService s.type s.original-instance-name new-instance s.port s.txt
     log.warn "Service-instance renamed"
         --tags={"old": s.instance-name, "new": new-instance}
     enter-probing_
 
-  /**
-  Returns the SRV target hostnames proposed in the probe's Authority
-  Section for a given service instance name.
-  */
-  get-authority-srv-targets_ packet/dns.DecodedPacket name/string -> List:
-    result := []
-    packet.authorities.do: | res |
-      if (dns.name-equals res.name name) and res is dns.SrvResource:
-        result.add (res as dns.SrvResource).value
-    return result
+  handle-established-service-conflict_ i/int -> none:
+    now := Time.monotonic-us
+    if now - last-defend-time_ > 10_000_000:
+      defend-count_ = 0
+    if defend-count_ < 3:
+      defend-count_++
+      last-defend-time_ = now
+      send-defense_
+    else:
+      handle-service-conflict_ i
 
-  /**
-  Compares two DNS names lexicographically as binary strings (case
-  insensitive — RFC 6762 §3 case folding).  Returns positive if $a
-  wins, negative if $b wins, zero if equal.
-  */
-  static compare-names_ a/string b/string -> int:
-    al := a.to-ascii-lower
-    bl := b.to-ascii-lower
-    n := min al.size bl.size
-    n.repeat: | i |
-      diff := al[i] - bl[i]
-      if diff != 0: return diff
-    return al.size - bl.size
+  record-conflict_ -> none:
+    now := Time.monotonic-us
+    if now - conflict-window-start_ > CONFLICT-RATE-LIMIT-WINDOW-US_:
+      conflict-count_ = 0
+      conflict-window-start_ = now
+    conflict-count_++
 
-  enter-announcing_ generation/int:
+  enter-announcing_ generation/int -> none:
     state_ = STATE-ANNOUNCING
-    // RFC 6762 §8.3: "The Multicast DNS responder MUST send at least
-    //  two unsolicited responses, one second apart."
     send-announcement_
     sleep (Duration --s=1)
-    // Only send the second announcement if we are still the active
-    // probe generation and have not been moved back to probing (e.g.
-    // by a conflict during the 1s wait).
-    if probe-generation_ != generation: return
+    if stopped_ or probe-generation_ != generation: return
     if state_ == STATE-ANNOUNCING:
       send-announcement_
-    // Transition to established only if no conflict moved us back to
-    // probing during the announcement window.  Without this guard, a
-    // conflict during the sleep above could be silently overwritten.
-    if probe-generation_ == generation and state_ == STATE-ANNOUNCING:
+    if not stopped_ and probe-generation_ == generation and state_ == STATE-ANNOUNCING:
       state_ = STATE-ESTABLISHED
       log.info "Service established" --tags={"hostname": hostname_, "ip": local-ip_}
 
-  send-probe_:
-    questions := [dns.Question hostname_ dns.RECORD-ANY]
-    // Add Questions for Service Instances too
+  send-probe_ -> none:
+    if socket_.is-closed: return
+    // RFC 6762 §8.1: Probe questions SHOULD set the QU (unicast-response) bit.
+    questions := [dns.Question hostname_ dns.RECORD-ANY --unicast-ok]
     services_.do: | s/RegisteredService |
-      questions.add (dns.Question s.full-name dns.RECORD-ANY)
+      questions.add (dns.Question s.full-name dns.RECORD-ANY --unicast-ok)
 
-    // RFC 6762 §8.2: Include all proposed unique records in the
-    // Authority Section so other simultaneously-probing devices can do
-    // tiebreaking on each name independently. We include the hostname's
-    // A record and an SRV record per registered service instance.
+    // RFC 6762 §8.2: Include ALL proposed unique records in the Authority Section.
     authorities := [dns.AResource hostname_ 120 local-ip_]
     services_.do: | s/RegisteredService |
       authorities.add (dns.SrvResource s.full-name dns.RECORD-SRV 120 false hostname_ 0 0 s.port)
+      authorities.add (dns.TxtResource s.full-name 4500 false (build-txt-list_ s.txt))
 
-    answers := []
-    packet := dns.create-dns-packet questions answers
-        --id=0
-        --is-response=false
-        --authorities=authorities
-    
-    if socket_.is-closed: return
-    // Multicast sends are best-effort. On some platforms (e.g. macOS),
-    // sendto() to a multicast address may fail with NOT_CONNECTED when
-    // no valid route exists.  The protocol recovers via re-probing.
-    catch --trace: socket_.send packet
+    send-raw_ --queries=questions --records=[] --no-is-response --authorities=authorities
 
-  send-announcement_:
-    questions := []
-    // A Record
+  build-full-announcement-records_ -> List:
     answers := [dns.AResource hostname_ 120 local-ip_ --flush]
-    
-    // Add Service Records
     services_.do: | s/RegisteredService |
-      // PTR: _type._tcp.local -> Instance._type._tcp.local
       answers.add (dns.StringResource s.type-domain dns.RECORD-PTR 4500 false s.full-name)
-      // SRV: Instance -> hostname:port
       answers.add (dns.SrvResource s.full-name dns.RECORD-SRV 120 true hostname_ 0 0 s.port)
-      // TXT: Instance -> txt-data
-      txt-list := build-txt-list_ s.txt
-      answers.add (dns.TxtResource s.full-name 4500 true txt-list)
-       
-    packet := dns.create-dns-packet questions answers --id=0 --is-response --is-authoritative
+      answers.add (dns.TxtResource s.full-name 4500 true (build-txt-list_ s.txt))
+    return answers
+
+  send-announcement_ -> none:
     if socket_.is-closed: return
+    answers := build-full-announcement-records_
     now := Time.monotonic-us
-    answers.do: | rec |
-      last-multicast-times_["$rec.name:$rec.type"] = now
-    // Best-effort — see send-probe_ comment.
-    catch --trace: socket_.send packet
+    answers.do: | rec/dns.Resource |
+      last-multicast-times_[record-rate-key_ rec] = now
+    send-raw_ --queries=[] --records=answers --is-response --is-authoritative
 
-  /**
-  Returns true if the record for $name and $type has been multicast within
-  one quarter of $ttl-s seconds (RFC 6762 §5.4).
-  When receiving a question with the QU (unicast-response) bit set, a
-  responder SHOULD respond via unicast only if the record was multicast
-  within the last TTL/4; otherwise it SHOULD multicast the response to
-  keep peer caches fresh and permit passive conflict detection.
-  */
-  was-multicast-within-quarter-ttl_ name/string type/int ttl-s/int now/int -> bool:
-    last := last-multicast-times_.get "$name:$type"
+  send-defense_ -> none:
+    if socket_.is-closed: return
+    enqueue-or-send-multicast_ build-full-announcement-records_ Time.monotonic-us
+        --min-interval-us=PROBE-DEFENSE-RATE-LIMIT-US_
+
+  send-goodbye_ -> none:
+    if socket_.is-closed: return
+    records := [dns.AResource hostname_ 0 local-ip_]
+    services_.do: | s/RegisteredService |
+      records.add (dns.StringResource s.type-domain dns.RECORD-PTR 0 false s.full-name)
+      records.add (dns.SrvResource s.full-name dns.RECORD-SRV 0 false hostname_ 0 0 s.port)
+      records.add (dns.TxtResource s.full-name 0 false (build-txt-list_ s.txt))
+    send-raw_ --queries=[] --records=records --is-response --is-authoritative
+
+  send-host-goodbye_ old-hostname/string -> none:
+    if socket_.is-closed: return
+    send-raw_
+        --queries=[]
+        --records=[dns.AResource old-hostname 0 local-ip_]
+        --is-response
+        --is-authoritative
+
+  send-service-goodbye_ s/RegisteredService -> none:
+    if socket_.is-closed: return
+    records := [
+      dns.StringResource s.type-domain dns.RECORD-PTR 0 false s.full-name,
+      dns.SrvResource s.full-name dns.RECORD-SRV 0 false hostname_ 0 0 s.port,
+      dns.TxtResource s.full-name 0 false (build-txt-list_ s.txt),
+    ]
+    send-raw_ --queries=[] --records=records --is-response --is-authoritative
+
+  was-multicast-within-quarter-ttl_ rec/dns.Resource ttl-s/int now/int -> bool:
+    last := last-multicast-times_.get (record-rate-key_ rec)
     if not last: return false
-    quarter-ttl-us := ttl-s * 250_000
-    return (now - last) < quarter-ttl-us
+    return (now - last) < (ttl-s * 250_000)
+
+  record-rate-key_ rec/dns.Resource -> string:
+    owner := rec.name.to-ascii-lower
+    if rec.type == dns.RECORD-PTR and rec is dns.StringResource:
+      return "$owner:$(rec.type):$((rec as dns.StringResource).value.to-ascii-lower)"
+    return "$owner:$(rec.type)"
 
   /**
-  Sends a response to a query.
-  Checks QU bits in questions to determine unicast vs multicast.
-  Applies Known-Answer Suppression per RFC 6762 §7.1.
+  Sends a response to a query, handling QU/legacy unicast, Known-Answer
+  Suppression (RFC 6762 §7.1), restricted-form `NSEC` negative answers
+  (RFC 6762 §6.1), and rate-limited / deferred multicast transmission.
   */
-  send-response_ query/dns.DecodedPacket? --source/net.SocketAddress?=null:
+  send-response_ query/dns.DecodedPacket? --source/net.SocketAddress?=null -> none:
+    if socket_.is-closed: return
     unicast-answers := []
+    unicast-additionals := []
     multicast-answers := []
+    multicast-additionals := []
     legacy-query := source != null and source.port != expected-port_
+    is-probe-query := query != null and not query.authorities.is-empty
     now := Time.monotonic-us
 
-    // 1. Hostname A Record
+    // 1. Hostname A record + restricted-form NSEC for unsupported types (e.g. AAAA).
     q-host := find-question_ query hostname_ dns.RECORD-A
     if q-host:
       host-answer := legacy-query
           ? dns.AResource hostname_ 10 local-ip_
           : dns.AResource hostname_ 120 local-ip_ --flush
-      // RFC 6762 §7.1: Suppress if already in Known-Answer Section
-      // with TTL ≥ 50% of our real TTL.
       if not query or not dns.has-known-answer query hostname_ dns.RECORD-A 120 --record=host-answer:
+        // Probe defenses are always multicast so co-hosted SO_REUSEPORT sockets
+        // and LAN peers reliably observe the defense (RFC 6762 §6 / §8).
         use-unicast := legacy-query or
-            (source != null and q-host.unicast-ok and (was-multicast-within-quarter-ttl_ hostname_ dns.RECORD-A 120 now))
-        target := use-unicast ? unicast-answers : multicast-answers
-        target.add host-answer
+            (not is-probe-query and source != null and q-host.unicast-ok and
+                (was-multicast-within-quarter-ttl_ host-answer 120 now))
+        add-unique-record_ (use-unicast ? unicast-answers : multicast-answers) host-answer
     else if not query:
-      // Announcement
-      multicast-answers.add (dns.AResource hostname_ 120 local-ip_ --flush)
+      add-unique-record_ multicast-answers (dns.AResource hostname_ 120 local-ip_ --flush)
 
-    // 2. Services. Snapshot the size up front: if another task adds
-    // a service while we are iterating (and we yield in socket_.send),
-    // we must not start answering for an unprobed service from the
-    // current packet.
+    q-host-neg := find-negative-question_ query hostname_ [dns.RECORD-A]
+    if q-host-neg:
+      nsec-ttl := legacy-query ? 10 : 120
+      nsec := dns.NsecResource hostname_ nsec-ttl (not legacy-query) hostname_ [dns.RECORD-A]
+      if not dns.has-known-answer query hostname_ dns.RECORD-NSEC 120 --record=nsec:
+        use-unicast := legacy-query or
+            (not is-probe-query and source != null and q-host-neg.unicast-ok and
+                (was-multicast-within-quarter-ttl_ nsec 120 now))
+        add-unique-record_ (use-unicast ? unicast-answers : multicast-answers) nsec
+
+    // 2. Registered Services.
     services-snapshot-size := services_.size
     services-snapshot-size.repeat: | i |
       s/RegisteredService := services_[i]
-      // PTR for the type-domain (e.g. "_http._tcp.local" -> instance).
       q-ptr := find-question_ query s.type-domain dns.RECORD-PTR
-      // Meta-query PTR (RFC 6763 §9): "_services._dns-sd._udp.local"
-      // -> service type-domain (e.g. "_http._tcp.local").
       q-meta := find-question_ query "_services._dns-sd._udp.local" dns.RECORD-PTR
 
       ptr-ttl := legacy-query ? 10 : 4500
@@ -583,125 +499,274 @@ class StateManager:
       host-ttl := legacy-query ? 10 : 120
       additional-flush := not legacy-query
 
-      // Meta-query: answer with PTR(_services._dns-sd._udp.local -> type-domain).
       if q-meta:
         meta-answer := dns.StringResource
             "_services._dns-sd._udp.local"
             dns.RECORD-PTR
             ptr-ttl
-            false  // RFC 6763 §9: shared record, no cache-flush.
+            false
             s.type-domain
         if not (query and dns.has-known-answer query "_services._dns-sd._udp.local" dns.RECORD-PTR 4500 --record=meta-answer):
           use-unicast := legacy-query or
-              (source != null and q-meta.unicast-ok and (was-multicast-within-quarter-ttl_ "_services._dns-sd._udp.local" dns.RECORD-PTR 4500 now))
-          (use-unicast ? unicast-answers : multicast-answers).add meta-answer
+              (not is-probe-query and source != null and q-meta.unicast-ok and
+                  (was-multicast-within-quarter-ttl_ meta-answer 4500 now))
+          add-unique-record_ (use-unicast ? unicast-answers : multicast-answers) meta-answer
 
-      // Type-domain PTR: answer with PTR(type-domain -> instance) plus
-      // SRV/TXT/A additionals. RFC 6763 §12.1 recommends including
-      // these as additional records.
       if q-ptr:
-        ptr-answer := dns.StringResource s.type-domain dns.RECORD-PTR
-            ptr-ttl
-            false  // PTR is a shared record; never flush.
-            s.full-name
-        // Apply known-answer suppression to the PTR. If suppressed,
-        // we still process the direct SRV/TXT queries below.
+        ptr-answer := dns.StringResource s.type-domain dns.RECORD-PTR ptr-ttl false s.full-name
         ptr-suppressed := query and
             dns.has-known-answer query s.type-domain dns.RECORD-PTR 4500 --record=ptr-answer
         if not ptr-suppressed:
           use-unicast := legacy-query or
-              (source != null and q-ptr.unicast-ok and (was-multicast-within-quarter-ttl_ s.type-domain dns.RECORD-PTR 4500 now))
-          target := use-unicast ? unicast-answers : multicast-answers
-          target.add ptr-answer
-          target.add (dns.SrvResource s.full-name dns.RECORD-SRV srv-ttl additional-flush hostname_ 0 0 s.port)
-          txt-list := build-txt-list_ s.txt
-          target.add (dns.TxtResource s.full-name txt-ttl additional-flush txt-list)
-          target.add (dns.AResource hostname_ host-ttl local-ip_)
+              (not is-probe-query and source != null and q-ptr.unicast-ok and
+                  (was-multicast-within-quarter-ttl_ ptr-answer 4500 now))
+          ans-target := use-unicast ? unicast-answers : multicast-answers
+          add-target := use-unicast ? unicast-additionals : multicast-additionals
+          add-unique-record_ ans-target ptr-answer
+          // RFC 6763 §12.1: Include SRV, TXT, and A in the Additional Record Section.
+          add-unique-record_ add-target (dns.SrvResource s.full-name dns.RECORD-SRV srv-ttl additional-flush hostname_ 0 0 s.port)
+          add-unique-record_ add-target (dns.TxtResource s.full-name txt-ttl additional-flush (build-txt-list_ s.txt))
+          add-unique-record_ add-target (dns.AResource hostname_ host-ttl local-ip_ --flush=additional-flush)
 
-      // SRV/TXT direct query (independent of PTR suppression).
       q-srv := find-question_ query s.full-name dns.RECORD-SRV
       q-txt := find-question_ query s.full-name dns.RECORD-TXT
       if q-srv or q-txt:
-        srv-ok := not q-srv or (q-srv.unicast-ok and (was-multicast-within-quarter-ttl_ s.full-name dns.RECORD-SRV 120 now))
-        txt-ok := not q-txt or (q-txt.unicast-ok and (was-multicast-within-quarter-ttl_ s.full-name dns.RECORD-TXT 4500 now))
-        use-unicast := legacy-query or (source != null and srv-ok and txt-ok)
-        target := use-unicast ? unicast-answers : multicast-answers
-        if q-srv:
-          target.add (dns.SrvResource s.full-name dns.RECORD-SRV srv-ttl additional-flush hostname_ 0 0 s.port)
-        if q-txt:
-          txt-list := build-txt-list_ s.txt
-          target.add (dns.TxtResource s.full-name txt-ttl additional-flush txt-list)
-        target.add (dns.AResource hostname_ host-ttl local-ip_)
+        srv-rec := dns.SrvResource s.full-name dns.RECORD-SRV srv-ttl additional-flush hostname_ 0 0 s.port
+        txt-rec := dns.TxtResource s.full-name txt-ttl additional-flush (build-txt-list_ s.txt)
+        srv-suppressed := q-srv != null and query != null and
+            (dns.has-known-answer query s.full-name dns.RECORD-SRV 120 --record=srv-rec)
+        txt-suppressed := q-txt != null and query != null and
+            (dns.has-known-answer query s.full-name dns.RECORD-TXT 4500 --record=txt-rec)
 
-    // Send Unicast
+        want-srv := q-srv != null and not srv-suppressed
+        want-txt := q-txt != null and not txt-suppressed
+        if want-srv or want-txt:
+          srv-ok := not want-srv or (q-srv.unicast-ok and (was-multicast-within-quarter-ttl_ srv-rec 120 now))
+          txt-ok := not want-txt or (q-txt.unicast-ok and (was-multicast-within-quarter-ttl_ txt-rec 4500 now))
+          use-unicast := legacy-query or (not is-probe-query and source != null and srv-ok and txt-ok)
+          ans-target := use-unicast ? unicast-answers : multicast-answers
+          add-target := use-unicast ? unicast-additionals : multicast-additionals
+          if want-srv: add-unique-record_ ans-target srv-rec
+          if want-txt: add-unique-record_ ans-target txt-rec
+          // RFC 6763 §12.2: Include target host address in the Additional Record Section.
+          add-unique-record_ add-target (dns.AResource hostname_ host-ttl local-ip_ --flush=additional-flush)
+
+      q-srv-neg := find-negative-question_ query s.full-name [dns.RECORD-SRV, dns.RECORD-TXT]
+      if q-srv-neg:
+        nsec-ttl := legacy-query ? 10 : 120
+        nsec := dns.NsecResource s.full-name nsec-ttl additional-flush s.full-name [dns.RECORD-TXT, dns.RECORD-SRV]
+        if not dns.has-known-answer query s.full-name dns.RECORD-NSEC 120 --record=nsec:
+          use-unicast := legacy-query or
+              (not is-probe-query and source != null and q-srv-neg.unicast-ok and
+                  (was-multicast-within-quarter-ttl_ nsec 120 now))
+          add-unique-record_ (use-unicast ? unicast-answers : multicast-answers) nsec
+
     if not unicast-answers.is-empty and source:
-      // For Unicast, ID matches query
+      filtered-uni-add := unicast-additionals.filter: | r/dns.Resource |
+        not (unicast-answers.any (: dns.resource-equals it r))
       id := query ? query.id : 0
       questions := legacy-query and query ? query.questions : []
-      // RFC 6762 §18.3: ID must match for legacy/unicast responses.
-      packet := dns.create-dns-packet questions unicast-answers --id=id --is-response --is-authoritative
-      // Best-effort: on some platforms (e.g. macOS) sendto() to a
-      // querier whose address we cannot route to fails with
-      // NOT_CONNECTED / NO_ROUTE.  The protocol recovers because the
-      // querier will repeat its query.
-      catch --trace: socket_.send packet source
+      send-raw_
+          --queries=questions
+          --records=unicast-answers
+          --additionals=filtered-uni-add
+          --id=id
+          --is-response
+          --is-authoritative
+          --target=source
 
-    // Send Multicast
     if not multicast-answers.is-empty:
-      // RFC 6762 §6: Per-record rate limiting — suppress only records
-      // already sent within the last second.
-      filtered := multicast-answers.filter: | rec |
-        key := "$rec.name:$rec.type"
+      filtered-mcast-add := multicast-additionals.filter: | r/dns.Resource |
+        not (multicast-answers.any (: dns.resource-equals it r))
+      // RFC 6762 §6: Probe defenses are permitted at 250ms intervals;
+      // normal multicast responses are limited to 1s intervals.
+      min-interval := is-probe-query ? PROBE-DEFENSE-RATE-LIMIT-US_ : MULTICAST-RATE-LIMIT-WINDOW-US_
+      enqueue-or-send-multicast_ multicast-answers now
+          --additionals=filtered-mcast-add
+          --min-interval-us=min-interval
+
+  add-unique-record_ list/List record/dns.Resource -> none:
+    if list.any (: dns.resource-equals it record): return
+    list.add record
+
+  enqueue-or-send-multicast_ records/List now/int --additionals/List=[] --min-interval-us/int -> none:
+    ready := []
+    records.do: | rec/dns.Resource |
+      key := record-rate-key_ rec
+      last := last-multicast-times_.get key
+      if not last or (now - last) >= min-interval-us:
+        ready.add rec
+        last-multicast-times_[key] = now
+      else:
+        due-us := last + min-interval-us
+        existing/DeferredRecord_? := deferred-multicast_.get key
+        if existing:
+          effective-due := min existing.due-us due-us
+          deferred-multicast_[key] = DeferredRecord_ rec key effective-due
+        else if deferred-multicast_.size < MAX-DEFERRED-RECORDS_:
+          deferred-multicast_[key] = DeferredRecord_ rec key due-us
+
+    ready-additionals := []
+    if not ready.is-empty:
+      // Supplemental additional records are included opportunistically when
+      // permitted by the rate limit, and are never deferred into standalone packets.
+      additionals.do: | rec/dns.Resource |
+        key := record-rate-key_ rec
         last := last-multicast-times_.get key
-        not last or (now - last) >= MULTICAST-RATE-LIMIT-WINDOW-US_
-      if filtered.is-empty: return
-      filtered.do: | rec |
-        last-multicast-times_["$rec.name:$rec.type"] = now
+        if not last or (now - last) >= min-interval-us:
+          ready-additionals.add rec
+          last-multicast-times_[key] = now
 
-      // Prune entries older than the maximum quarter-TTL window so the
-      // map does not grow unboundedly as records come and go.
-      prune-last-multicast-times_ now
+    prune-last-multicast-times_ now
 
-      // For Multicast, ID must be 0 (RFC 6762 §18.1)
-      packet := dns.create-dns-packet [] filtered --id=0 --is-response --is-authoritative
-      // Best-effort multicast send — see send-probe_ for rationale.
-      catch --trace: socket_.send packet // Uses default multicast target
+    if not ready.is-empty:
+      send-raw_
+          --queries=[]
+          --records=ready
+          --additionals=ready-additionals
+          --is-response
+          --is-authoritative
 
-  // Per-record multicast rate limit (RFC 6762 §6: at most once per second).
-  static MULTICAST-RATE-LIMIT-WINDOW-US_ ::= 1_000_000
-  // Quarter of the longest TTL we emit (4500s / 4 = 1125s), used for
-  // RFC 6762 §5.4 QU multicast decisions.
-  static MAX-QU-MULTICAST-WINDOW-US_ ::= 4500 * 250_000
+    if not deferred-multicast_.is-empty:
+      schedule-deferred-multicast_
+
+  schedule-deferred-multicast_ -> none:
+    earliest-due := int.MAX
+    deferred-multicast_.do: | _ item/DeferredRecord_ |
+      if item.due-us < earliest-due: earliest-due = item.due-us
+    if earliest-due == int.MAX: return
+
+    // If a task is already scheduled to wake at or before earliest-due, let it run.
+    if deferred-send-task_ and deferred-wakeup-us_ <= earliest-due: return
+    if deferred-send-task_:
+      deferred-send-task_.cancel
+      deferred-send-task_ = null
+
+    deferred-wakeup-us_ = earliest-due
+    deferred-send-task_ = task::
+      try:
+        while not stopped_ and not deferred-multicast_.is-empty:
+          next-due := int.MAX
+          deferred-multicast_.do: | _ item/DeferredRecord_ |
+            if item.due-us < next-due: next-due = item.due-us
+          deferred-wakeup-us_ = next-due
+
+          wait-us := next-due - Time.monotonic-us
+          if wait-us > 0:
+            sleep (Duration --us=wait-us)
+          if stopped_ or (state_ != STATE-ANNOUNCING and state_ != STATE-ESTABLISHED):
+            break
+
+          send-now := Time.monotonic-us
+          due-records := []
+          sent-keys := []
+          // Coalesce any record due within 5ms into a single UDP packet.
+          deferred-multicast_.do: | key item/DeferredRecord_ |
+            if item.due-us <= send-now + 5_000:
+              due-records.add item.record
+              last-multicast-times_[key] = send-now
+              sent-keys.add key
+          sent-keys.do: deferred-multicast_.remove it
+
+          if not due-records.is-empty and not socket_.is-closed:
+            send-raw_ --queries=[] --records=due-records --is-response --is-authoritative
+      finally:
+        if deferred-send-task_ == Task.current:
+          deferred-send-task_ = null
+          deferred-wakeup-us_ = 0
+
+  cancel-deferred-multicast_ -> none:
+    deferred-multicast_.clear
+    if deferred-send-task_:
+      deferred-send-task_.cancel
+      deferred-send-task_ = null
+      deferred-wakeup-us_ = 0
+
+  send-raw_ -> none
+      --queries/List
+      --records/List
+      --id/int=0
+      --is-response/bool
+      --is-authoritative/bool=false
+      --authorities/List=[]
+      --additionals/List=[]
+      --target/net.SocketAddress?=null:
+    if socket_.is-closed: return
+    err := catch:
+      packet := dns.encode-mdns-packet queries records
+          --id=id
+          --is-response=is-response
+          --is-authoritative=is-authoritative
+          --authorities=authorities
+          --additionals=additionals
+      if target:
+        socket_.send packet target
+      else:
+        socket_.send packet
+    if err:
+      log.debug "mDNS send skipped" --tags={"error": err}
 
   prune-last-multicast-times_ now/int -> none:
-    stale := []
-    last-multicast-times_.do: | key timestamp |
-      if now - timestamp >= MAX-QU-MULTICAST-WINDOW-US_: stale.add key
-    stale.do: last-multicast-times_.remove it
+    if last-multicast-times_.size <= 32: return
+    last-multicast-times_.filter --in-place: | _ timestamp/int |
+      (now - timestamp) < MAX-QU-MULTICAST-WINDOW-US_
 
   find-question_ query/dns.DecodedPacket? name/string type/int -> dns.Question?:
     if not query: return null
-    query.questions.do: | q |
-       if (dns.name-equals q.name name) and (q.type == type or q.type == dns.RECORD-ANY): return q
+    query.questions.do: | q/dns.Question |
+      if (dns.name-equals q.name name) and (q.type == type or q.type == dns.RECORD-ANY):
+        return q
     return null
 
+  find-negative-question_ query/dns.DecodedPacket? name/string owned-types/List -> dns.Question?:
+    if not query: return null
+    query.questions.do: | q/dns.Question |
+      if (dns.name-equals q.name name) and q.type != dns.RECORD-ANY and not (owned-types.contains q.type):
+        return q
+    return null
+
+  /** Returns the current (possibly conflict-renamed) hostname. */
   hostname -> string:
     return hostname_
 
+  /**
+  Encodes a DNS-SD TXT map into RFC 6763 §6.4 `<character-string>` entries:
+  - Empty / null map -> `[""]` (single empty string per RFC 6763 §6.1).
+  - `v == false` -> key omitted.
+  - `v == null` or `v == true` -> `"key"` (boolean / no-value attribute without `=`).
+  - `v is ByteArray` -> binary `key=<raw bytes>` `ByteArray` clamped to 255 octets.
+  - Other values -> `"key=value"` clamped to 255 octets.
+  */
   build-txt-list_ txt/Map? -> List:
     if not txt or txt.is-empty: return [""]
     list := []
     txt.do: | k v |
-       list.add "$k=$v"
-    return list
+      key-str := "$k"
+      if key-str.is-empty or key-str.size > 255: continue.do
+      if v == false: continue.do
+      if v == null or v == true:
+        list.add key-str
+      else if v is ByteArray:
+        prefix := "$key-str=".to-byte-array
+        raw := v as ByteArray
+        max-val := 255 - prefix.size
+        if max-val >= 0:
+          clipped := raw.size > max-val ? raw[..max-val] : raw
+          list.add (prefix + clipped)
+      else:
+        entry := "$key-str=$v"
+        entry = dns.truncate-utf8 entry 255
+        list.add entry
+    return list.is-empty ? [""] : list
 
 class RegisteredService:
   type/string
+  original-instance-name/string
   instance-name/string
   port/int
   txt/Map?
-  
-  constructor .type .instance-name .port .txt:
+
+  constructor .type .original-instance-name .instance-name .port .txt:
 
   full-name -> string:
     return "$(instance-name).$(type).local"
