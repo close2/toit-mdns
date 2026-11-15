@@ -1,156 +1,195 @@
 /**
 mDNS query engine and response processor.
 
-Provides the core lookup functionality with cache-first semantics:
-1. Check cache for existing records
-2. If not cached, send multicast query and wait for responses
-3. Cache all received answers for future queries
-
-# Pending Query Coordination
-
-When multiple tasks query for the same name simultaneously, they share
-a single pending query via a $Latch. This avoids flooding the network
-with duplicate queries - only one packet is sent, and all waiters are
-notified when the response arrives.
-
-# Record Type Handling
-
-Queries support multiple record types via bitmask (e.g., A | AAAA).
-The engine expands this bitmask into appropriate DNS questions and
-collates responses from the cache.
+Coordinates lookups, manages the response cache, and processes incoming
+mDNS responses:
+- Cache-first resolution for unique records (`A`, `AAAA`, `SRV`, `TXT`),
+  including instant negative resolution via cached `NSEC` records (RFC 6762 §6.1).
+- Multi-responder collection window and Known-Answer population for shared
+  `PTR` service browsing (RFC 6762 §7.1, RFC 6763 §11).
+- Exponential query retransmission (`1s, 2s, 4s, ...` per RFC 6762 §5.2) and
+  in-flight query coalescing so concurrent callers do not burst duplicate
+  multicast queries within 1 second.
 */
 
-import net
-import net.modules.dns
 import monitor show Latch
+import net.modules.dns
+import ..net.dns-helper as dns-helper
 import ..net.mdns-socket
 import .cache
 
-/**
-mDNS query engine.
-
-Coordinates lookups, manages the cache, and processes incoming responses.
-Uses cache-first semantics to minimize network traffic.
-*/
 class QueryEngine:
-  socket_/MdnsSocket
+  /// Aggregation window after first PTR answer so multiple responders (including
+  /// peers offset by RFC 6762 §8.1's 250ms probe jitter or §6.2's 120ms shared
+  /// response delay) can reply before browse returns.
+  static BROWSE-AGGREGATION-US_ ::= 350_000
+  /// Initial retransmission interval per RFC 6762 §5.2 (1 second).
+  static INITIAL-RETRY-INTERVAL-US_ ::= 1_000_000
+  /// Minimum interval between identical multicast queries (RFC 6762 §6).
+  static MIN-QUERY-INTERVAL-US_ ::= 900_000
+  /// Maximum Known-Answer records attached to a single outgoing query packet.
+  static MAX-KNOWN-ANSWERS_ ::= 16
+
+  socket_/MdnsSocket := ?
   cache_/MdnsCache
-  pending_/Map := {:} // name -> List<PendingQuery_>
+  pending_/Map := {:}          // lowercased name -> List<PendingQuery_>
+  last-query-sent_/Map := {:}  // "name:mask" -> monotonic-us
 
   constructor .socket_ .cache_:
+
+  /** Replaces the underlying multicast socket after a network reset. */
+  update-socket socket/MdnsSocket -> none:
+    socket_ = socket
+
+  /** Returns true if one or more lookups are currently awaiting responses. */
+  has-pending -> bool:
+    return not pending_.is-empty
 
   lookup name/string -> List
       --record-types/int
       --timeout-us/int:
-    // RFC 6762 §16: DNS names are case-insensitive. Normalize the
-    // key we use for the cache and for matching incoming responses.
     name = name.to-ascii-lower
-    // 1. Check Cache
-    answers := search-cache_ name record-types
-    if not answers.is-empty: return answers
+    if record-types == 0 or timeout-us <= 0: return []
 
-    // 2. Query - use a Latch to coordinate waiting
-    query := PendingQuery_ record-types
+    is-ptr-browse := record-types == dns.RECORD-PTR
+
+    // 1. For unique record lookups, return immediately on positive or NSEC cache hit.
+    if not is-ptr-browse:
+      answers := search-cache_ name record-types
+      if not answers.is-empty: return answers
+      if is-negatively-cached_ name record-types: return []
+
+    // 2. Register in-flight pending query so process-packet caches relevant packets.
+    query := PendingQuery_ record-types --shared=is-ptr-browse
     listeners := pending_.get name --init=(: [])
     listeners.add query
 
-    // Send query packet
-    send-query_ name record-types
+    deadline := Time.monotonic-us + timeout-us
+    retry-interval-us := INITIAL-RETRY-INTERVAL-US_
+    // If browsing PTR with pre-existing cached instances, send one Known-Answer
+    // query and cap the wait if no additional responder answers quickly.
+    cached-ptr := is-ptr-browse ? (search-cache_ name record-types) : []
+    if is-ptr-browse and not cached-ptr.is-empty:
+      deadline = min deadline (Time.monotonic-us + (min timeout-us 250_000))
 
-    // 3. Wait with timeout
     try:
-      // Use catch to handle timeout exception and return empty list
-      catch --unwind=(: it != "DEADLINE_EXCEEDED"):
-        with-timeout (Duration --us=timeout-us):
-          return query.latch.get
+      while true:
+        now := Time.monotonic-us
+        remaining-us := deadline - now
+        if remaining-us <= 0: break
+
+        maybe-send-query_ name record-types now
+        wait-us := min retry-interval-us remaining-us
+
+        timed-out := false
+        catch --unwind=(: it != "DEADLINE_EXCEEDED"):
+          with-timeout (Duration --us=wait-us):
+            first := query.latch.get
+            if is-ptr-browse:
+              // Brief aggregation window so additional LAN responders can answer.
+              extra-us := min BROWSE-AGGREGATION-US_ (deadline - Time.monotonic-us)
+              if extra-us > 0:
+                sleep (Duration --us=extra-us)
+              return search-cache_ name record-types
+            return first
+          timed-out = false
+        if not query.latch.has-value:
+          timed-out = true
+        if not timed-out and query.latch.has-value:
+          return is-ptr-browse ? (search-cache_ name record-types) : query.latch.get
+
+        retry-interval-us *= 2
     finally:
-      // Cleanup
       listeners.remove query
       if listeners.is-empty: pending_.remove name
+      prune-query-timestamps_
 
-    // Timeout reached.
-    return []
-
+    return search-cache_ name record-types
 
   /**
-  Called from the service for every packet.
-
-  Only adds records to the cache for names we are actively looking
-  up.  Passively absorbing every multicast record visible on the
-  LAN — printers, AppleTVs, phones, etc. — would slowly bloat the
-  cache (their TTLs are typically 4500 s), and we never use those
-  records anyway.
+  Processes a validated mDNS response packet from the socket receive loop.
   */
-  process-packet packet/dns.DecodedPacket:
-    // Fast path: when nothing is pending, do not allocate the
-    // names-in-packet set or scan the resource lists.
+  process-packet packet/dns.DecodedPacket -> none:
     if pending_.is-empty: return
 
-    // If a packet contains a record for a name we are actively
-    // looking up, keep the whole packet. DNS-SD responses commonly
-    // include useful SRV/TXT/A additionals whose names differ from the
-    // primary PTR question.
     if is-relevant-packet_ packet:
       add-all_ packet.resources
       add-all_ packet.additionals
       add-all_ packet.authorities
 
-    // Notify pending queries if we have answers for them.
-    pending_.do: | name listeners/List |
-      results/List? := null
+    pending_.do: | name/string listeners/List |
       listeners.do: | query/PendingQuery_ |
         if not query.latch.has-value:
-          if results == null: results = search-cache_ name query.record-types
+          results := search-cache_ name query.record-types
           if not results.is-empty:
             query.latch.set results
+          else if not query.shared and (is-negatively-cached_ name query.record-types):
+            query.latch.set []
 
   is-relevant-packet_ packet/dns.DecodedPacket -> bool:
     return contains-pending-name_ packet.resources or
-      contains-pending-name_ packet.additionals or
-      contains-pending-name_ packet.authorities
+        contains-pending-name_ packet.additionals or
+        contains-pending-name_ packet.authorities
 
   contains-pending-name_ resources/List -> bool:
     resources.do: | res/dns.Resource |
       if pending_.contains res.name.to-ascii-lower: return true
     return false
 
-  add-all_ resources/List:
+  add-all_ resources/List -> none:
     resources.do: | res/dns.Resource |
       cache_.add res
 
+  maybe-send-query_ name/string record-types/int now/int -> none:
+    if socket_.is-closed: return
+    key := "$name:$record-types"
+    last := last-query-sent_.get key
+    if last and (now - last) < MIN-QUERY-INTERVAL-US_: return
 
-  send-query_ name/string record-types/int:
     questions := []
-    // Expand record-types bitmask to Questions
-    // Common types
-    // Prefer normal multicast replies. In local multi-client scenarios
-    // all mDNS sockets share the same UDP port with reuse-port, so QU
-    // replies can be delivered to the wrong socket and make lookups flaky.
-    if record-types & dns.RECORD-A != 0:
-      questions.add (dns.Question name dns.RECORD-A)
-    if record-types & dns.RECORD-AAAA != 0:
-      questions.add (dns.Question name dns.RECORD-AAAA)
-    if record-types & dns.RECORD-TXT != 0:
-      questions.add (dns.Question name dns.RECORD-TXT)
-    if record-types & dns.RECORD-SRV != 0:
-      questions.add (dns.Question name dns.RECORD-SRV)
-    if record-types & dns.RECORD-PTR != 0:
-      questions.add (dns.Question name dns.RECORD-PTR)
-      
+    known-answers := []
+    add-type := : | rr-type/int |
+      if record-types & rr-type != 0:
+        questions.add (dns.Question name rr-type)
+        if known-answers.size < MAX-KNOWN-ANSWERS_:
+          ka := cache_.lookup-known-answers name rr-type
+          ka.do:
+            if known-answers.size < MAX-KNOWN-ANSWERS_:
+              known-answers.add it
+
+    add-type.call dns.RECORD-A
+    add-type.call dns.RECORD-AAAA
+    add-type.call dns.RECORD-TXT
+    add-type.call dns.RECORD-SRV
+    add-type.call dns.RECORD-PTR
+
     if questions.is-empty: return
 
-    // Create packet
-    packet := dns.create-dns-packet questions [] 
-        --id=0
-        --no-is-response 
+    last-query-sent_[key] = now
+    catch:
+      packet := dns-helper.encode-mdns-packet questions known-answers
+          --id=0
+          --no-is-response
+      socket_.send packet
 
-    // Send via socket to multicast group
-    // The MdnsSocket caches the multicast target.
-    socket_.send packet
+  prune-query-timestamps_ -> none:
+    if last-query-sent_.size <= 32: return
+    cutoff := Time.monotonic-us - 10_000_000
+    last-query-sent_.filter --in-place: | _ ts/int | ts > cutoff
+
+  is-negatively-cached_ name/string record-types/int -> bool:
+    nsecs := cache_.lookup name dns-helper.RECORD-NSEC
+    if nsecs.is-empty: return false
+    nsec := nsecs[0] as dns-helper.NsecResource
+    if record-types & dns.RECORD-A != 0 and (nsec.has-type dns.RECORD-A): return false
+    if record-types & dns.RECORD-AAAA != 0 and (nsec.has-type dns.RECORD-AAAA): return false
+    if record-types & dns.RECORD-TXT != 0 and (nsec.has-type dns.RECORD-TXT): return false
+    if record-types & dns.RECORD-SRV != 0 and (nsec.has-type dns.RECORD-SRV): return false
+    if record-types & dns.RECORD-PTR != 0 and (nsec.has-type dns.RECORD-PTR): return false
+    return true
 
   search-cache_ name/string record-types/int -> List:
     results := []
-    // Iterate types in bitmask
     if record-types & dns.RECORD-A != 0:
       results.add-all (cache_.lookup name dns.RECORD-A)
     if record-types & dns.RECORD-AAAA != 0:
@@ -161,28 +200,27 @@ class QueryEngine:
       results.add-all (cache_.lookup name dns.RECORD-SRV)
     if record-types & dns.RECORD-PTR != 0:
       results.add-all (cache_.lookup name dns.RECORD-PTR)
-      
-    // Serialize returns
+
     return serialize-results_ results
 
   serialize-results_ resources/List -> List:
-    // Format: [type, data]
     return resources.map: | res/dns.Resource |
       data := null
       if res is dns.AResource:
         data = (res as dns.AResource).address.to-byte-array
       else if res is dns.SrvResource:
         srv := res as dns.SrvResource
-        // SrvResource extends StringResource, value is target.
-        target := srv.value 
-        data = [srv.priority, srv.weight, srv.port, target]
+        data = [srv.priority, srv.weight, srv.port, srv.value]
+      else if res is dns.TxtResource:
+        data = (res as dns.TxtResource).text
       else if res is dns.StringResource:
         data = (res as dns.StringResource).value
-      
+
       [res.type, data]
 
 class PendingQuery_:
   latch/Latch := Latch
   record-types/int
+  shared/bool
 
-  constructor .record-types:
+  constructor .record-types --.shared/bool=false:

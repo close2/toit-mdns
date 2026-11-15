@@ -33,10 +33,18 @@ test-hostname-query-type-must-match:
     monitor := MdnsSocket --network=network --port=TEST-PORT
     try:
       query := dns.create-dns-packet [dns.Question "typed.local" dns.RECORD-TXT] [] --id=0x1001 --is-response=false
+      drain-socket monitor
       sm.process-packet (dns-helper.parse query) --source=monitor.local-address
 
+      // RFC 6762 §6.1: Querying a unique hostname for an unsupported record
+      // type (TXT) must NOT return A or TXT, and instead returns restricted-form NSEC.
       response := wait-for-mdns-response monitor "typed.local"
-      expect-null response
+      expect-not-null response
+      response.resources.do: | res |
+        expect (res.type != dns.RECORD-A and res.type != dns.RECORD-TXT)
+      saw-nsec := response.resources.any: | res |
+        res.name == "typed.local" and res.type == dns-helper.RECORD-NSEC
+      expect saw-nsec
       print "  PASS"
     finally:
       monitor.close

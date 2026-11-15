@@ -1,62 +1,37 @@
 /**
 mDNS system service implementation.
 
-This module provides the $MdnsServiceProvider, a system service that runs
-persistently to handle all mDNS operations for the device.
-
-# RFC 6762 Compliance
-
-The service implements key aspects of RFC 6762 (Multicast DNS):
-- **Probing**: Before claiming a hostname, we probe to detect conflicts
-- **Announcing**: After successful probing, we announce our presence
-- **Conflict Resolution**: If another device uses our name, we rename
-- **Caching**: Responses are cached to reduce network traffic
-
-# Component Architecture
-
-The service is composed of specialized managers:
-- $StateManager: Handles probing/announcing state machine and conflict defense
-- $QueryEngine: Processes queries and manages the response cache
-- $ConflictManager: Generates new names when conflicts occur
-- $MdnsSocket: Wraps UDP multicast socket operations
-
-# Lazy Initialization
-
-The socket and managers are created on-demand when the first client connects.
-This conserves resources when mDNS is not actively being used.
+Provides $MdnsServiceProvider, a persistent system service that coordinates
+multicast socket I/O, caching, query resolution, and per-hostname state
+machines across one or more client containers.
 */
 
+import log
 import net
 import net.modules.dns
-import system as system
 import system.services
 
-import log
-
-import .api.mdns_service
-import .net.dns_helper as dns
-import .net.mdns_socket
-import .server.conflict_manager
+import .api.mdns-service
+import .net.dns-helper as dns
+import .net.mdns-socket
 import .server.cache
-import .server.query_engine
-import .server.state_manager
+import .server.conflict-manager
+import .server.query-engine
+import .server.state-manager
 
 /**
 mDNS system service provider.
 
-This service runs persistently and handles all mDNS operations for the device.
 Multiple client applications can share this single service instance,
-benefiting from shared caching and coordinated announcements.
-
-Implements the mDNS service logic and handles RPC calls from MdnsServiceClient.
-Uses reference counting to manage hostnames based on client commitments.
+benefiting from shared caching and reference-counted hostname / service
+announcements. Automatically recovers the multicast socket if the
+underlying network interface resets while active clients are attached.
 */
 class MdnsServiceProvider extends services.ServiceProvider
     implements services.ServiceHandler:
-  
-  managers_/Map := {:} // Map<string, StateManager>
-  manager-refs_/Map := {:} // Map<string, int>
-  client-commitments_/Map := {:} // Map<int, string>
+  managers_/Map := {:}            // lowercased hostname -> StateManager
+  manager-refs_/Map := {:}        // lowercased hostname -> int
+  client-commitments_/Map := {:}  // client-id -> lowercased hostname
 
   socket_/MdnsSocket? := null
   cache_/MdnsCache? := null
@@ -68,8 +43,8 @@ class MdnsServiceProvider extends services.ServiceProvider
   local-ip/net.IpAddress?
   resolved-local-ip_/net.IpAddress? := null
 
-  local-client-counter_ := -1
-
+  local-client-counter_/int := -1
+  closed_/bool := false
 
   constructor
       --.port/int=MDNS-PORT
@@ -78,11 +53,10 @@ class MdnsServiceProvider extends services.ServiceProvider
     super "mdns" --major=1 --minor=0
     provides MdnsService.SELECTOR --handler=this
 
-  on-opened client/int:
-    // We wait for the client to set a hostname.
+  on-opened client/int -> none:
     ensure-socket_
-  
-  on-closed client/int:
+
+  on-closed client/int -> none:
     cleanup-client_ client
 
   handle index/int arguments/any -> any
@@ -100,17 +74,9 @@ class MdnsServiceProvider extends services.ServiceProvider
       port_ := args[1] as int
       txt := args[2]
       instance-name := args[3]
-      // Use client context if explicit hostname not provided (though arguments might still allow it for overrides?)
-      // For now, let's assume REGISTER uses the client's committed hostname.
-      // The RPC interface signature we have currently is: [type, port, txt, name, hostname]
-      // We should probably check if hostname is passed (it was optional in previous step).
-      // But the Plan says: "Uses client_commitments_[id] to find target manager."
-      
       target := args.size > 4 ? args[4] : null
       if not target: target = client-commitments_.get client
-      
       return register type port_ --txt=txt --name=instance-name --hostname=target
-      
     if index == MdnsService.SET-HOSTNAME-INDEX:
       return client-set-hostname_ client (arguments as string)
     if index == MdnsService.GET-HOSTNAME-INDEX:
@@ -123,82 +89,76 @@ class MdnsServiceProvider extends services.ServiceProvider
       --hostname/string?=null:
     ensure-socket_
     if not hostname: throw "No hostname specified for registration"
-    
-    manager/StateManager? := managers_.get hostname
+    key := hostname.to-ascii-lower
+    manager/StateManager? := managers_.get key
     if not manager:
-      // This implies the client must have "set-hostname" first to create the manager.
       throw "Hostname '$hostname' not active (call set-hostname first)"
-      
     manager.register-service type port --txt=txt --name=name
 
   client-set-hostname_ client/int name/string -> none:
+    if not dns.has-local-suffix name:
+      throw "Invalid hostname: $name"
     ensure-socket_
-    
-    // 1. Decrement old
-    old-name := client-commitments_.get client
-    if old-name:
-      decrement-ref_ old-name
+    key := name.to-ascii-lower
 
-    // 2. Update commitment
-    client-commitments_[client] = name
-    
-    // 3. Increment new
-    increment-ref_ name
+    old-key := client-commitments_.get client
+    if old-key == key: return
+    if old-key:
+      decrement-ref_ old-key
+
+    client-commitments_[client] = key
+    increment-ref_ key
 
   client-get-hostname_ client/int -> string:
-    committed-name := client-commitments_.get client
-    if not committed-name: throw "Client has not set a hostname"
-    manager := managers_.get committed-name
-    if not manager: throw "Manager not found for $committed-name"
+    committed-key := client-commitments_.get client
+    if not committed-key: throw "Client has not set a hostname"
+    manager/StateManager? := managers_.get committed-key
+    if not manager: throw "Manager not found for $committed-key"
     return manager.hostname
 
-  increment-ref_ name/string:
-    refs := manager-refs_.get name --init=(: 0)
-    manager-refs_[name] = refs + 1
-    
-    if not managers_.contains name:
+  increment-ref_ key/string -> none:
+    refs := manager-refs_.get key --init=(: 0)
+    manager-refs_[key] = refs + 1
+
+    if not managers_.contains key:
       cm := ConflictManager
-      manager := StateManager socket_ cm name resolved-local-ip_ --expected-port=port
-      managers_[name] = manager
+      manager := StateManager socket_ cm key resolved-local-ip_ --expected-port=port
+      managers_[key] = manager
       manager.start
 
-  decrement-ref_ name/string:
-    curr := manager-refs_.get name
+  decrement-ref_ key/string -> none:
+    curr := manager-refs_.get key
     if not curr:
-      // Defensive: a decrement without a matching increment indicates
-      // an inconsistency in client bookkeeping.  Log so it surfaces
-      // in field diagnostics, but stay alive.
-      log.warn "mDNS decrement-ref_ with no current count" --tags={"name": name}
+      log.warn "mDNS decrement-ref_ with no current count" --tags={"name": key}
       return
 
     new-count := curr - 1
-    if new-count < 0:
-      // Should be unreachable thanks to the guard above and because
-      // we synchronously remove the entry once it reaches zero.  Log
-      // and clamp.
-      log.warn "mDNS ref-count went negative" --tags={"name": name, "count": new-count}
-      new-count = 0
-    manager-refs_[name] = new-count
-
     if new-count <= 0:
-      manager/StateManager? := managers_.get name
+      manager/StateManager? := managers_.get key
       if manager:
         manager.stop
-        managers_.remove name
-      manager-refs_.remove name
+        managers_.remove key
+      manager-refs_.remove key
+    else:
+      manager-refs_[key] = new-count
 
-  cleanup-client_ client/int:
-    hostname := client-commitments_.get client
-    if hostname:
-      decrement-ref_ hostname
+  cleanup-client_ client/int -> none:
+    key := client-commitments_.get client
+    if key:
       client-commitments_.remove client
+      decrement-ref_ key
 
-  ensure-socket_:
-    if socket_: return
-    // Retain `network` only via $MdnsSocket so that the proxy is kept
-    // alive (see $MdnsSocket for why) and freed exactly when we close
-    // the socket.  If construction throws partway through we close
-    // the half-built socket so we don't leak a network reference.
+  ensure-socket_ -> none:
+    if socket_ and not socket_.is-closed: return
+    open-socket-and-bind_
+
+    receive-task_ = task::
+      try:
+        receive-loop_
+      finally:
+        if receive-task_ == Task.current: receive-task_ = null
+
+  open-socket-and-bind_ -> none:
     network := net.open
     new-socket/MdnsSocket? := null
     try:
@@ -206,27 +166,23 @@ class MdnsServiceProvider extends services.ServiceProvider
       socket_ = new-socket
       resolved-local-ip_ = local-ip or network.address
 
-      cache_ = MdnsCache
-      query-engine_ = QueryEngine socket_ cache_
+      if not cache_: cache_ = MdnsCache
+      if query-engine_:
+        query-engine_.update-socket socket_
+      else:
+        query-engine_ = QueryEngine socket_ cache_
 
-      // Start receiving loop and remember the task so $close can
-      // cancel it deterministically instead of relying on the loop
-      // catching the post-close receive error.
-      receive-task_ = task::
-        try:
-          receive-loop_
-        finally:
-          if receive-task_ == Task.current: receive-task_ = null
-      // Hand-off succeeded; suppress the cleanup below.
+      managers_.do: | _ manager/StateManager |
+        manager.update-network socket_ resolved-local-ip_
+
       new-socket = null
     finally:
       if new-socket:
-        // Constructor or follow-up code threw — drop the half-built
-        // socket so the network proxy can be released.
         new-socket.close
         socket_ = null
+        network.close
 
-  receive-loop_:
+  receive-loop_ -> none:
     while not closed_:
       exception := catch:
         datagram := socket_.receive
@@ -234,43 +190,66 @@ class MdnsServiceProvider extends services.ServiceProvider
         if not datagram: continue
 
         packet-bytes := datagram.data
+        // Zero-allocation header & port check before constructing DecodedPacket:
+        // - RFC 6762 §18.3 / §18.11: Ignore non-zero OPCODE or RCODE.
+        // - RFC 6762 §6.10: Ignore responses not originating from port 5353.
+        if not dns.is-valid-raw-mdns-header packet-bytes: continue
+        is-response := (packet-bytes[2] & 0x80) != 0
+        if is-response and datagram.address.port != port: continue
 
-        // Parse once to validate the packet. Malformed packets from
-        // non-mDNS multicast traffic are silently skipped.
         decoded/dns.DecodedPacket? := null
         parse-exception := catch:
           decoded = dns.parse packet-bytes
-        if parse-exception:
+        if parse-exception or not decoded:
           log.debug "mDNS ignoring malformed packet" --tags={"error": parse-exception}
           continue
 
-        // Broadcast to all state managers (per-manager isolation).
-        managers_.do: | name manager/StateManager |
+        if not dns.is-valid-mdns-message decoded: continue
+
+        // Snapshot manager values in case conflict/client handlers mutate managers_.
+        active-managers := managers_.values
+        active-managers.do: | manager/StateManager |
           manager-exception := catch:
             manager.process-packet decoded --source=datagram.address
           if manager-exception:
             log.warn "mDNS manager processing error"
-                --tags={"error": manager-exception, "manager": name}
+                --tags={"error": manager-exception, "hostname": manager.hostname}
 
-        // Allow QueryEngine to process answers/updates.
-        // RFC 6762 §7.3: "A Multicast DNS querier MUST NOT cache
-        //  resource records observed in the Known-Answer Section of
-        //  other Multicast DNS queries." — Only cache from responses.
-        if decoded.is-response:
+        // RFC 6762 §7.3 & §6.10: Only cache/resolve from validated port-5353 responses.
+        if decoded.is-response and datagram.address.port == port:
           query-exception := catch:
             query-engine_.process-packet decoded
           if query-exception:
             log.warn "mDNS query-engine processing error"
                 --tags={"error": query-exception}
-      if exception:
-        if not closed_: log.error "mDNS receive error" --tags={"error": exception}
-        return
 
-  closed_/bool := false
-  
-  close:
+      if exception:
+        if closed_: return
+        log.warn "mDNS receive error; resetting socket" --tags={"error": exception}
+        broken := socket_
+        socket_ = null
+        resolved-local-ip_ = null
+        if broken: catch: broken.close
+
+        // If no managers or active queries remain, exit cleanly and let the
+        // next client request re-initialize lazily via ensure-socket_.
+        if managers_.is-empty and (not query-engine_ or not query-engine_.has-pending):
+          return
+
+        backoff-ms := 1000
+        while not closed_ and not socket_:
+          sleep (Duration --ms=backoff-ms)
+          if closed_: return
+          reopen-err := catch:
+            open-socket-and-bind_
+          if reopen-err:
+            log.warn "mDNS socket reopen retry failed" --tags={"error": reopen-err}
+            backoff-ms = min (backoff-ms * 2) 10_000
+
+  close -> none:
+    if closed_: return
     closed_ = true
-    managers_.do: | name manager/StateManager |
+    managers_.do: | _ manager/StateManager |
       manager.stop
     if receive-task_:
       receive-task_.cancel
@@ -287,7 +266,11 @@ class MdnsServiceProvider extends services.ServiceProvider
     mask := 0
     if accept-ipv4: mask |= dns.RECORD-A
     if accept-ipv6: mask |= dns.RECORD-AAAA
-    return query-engine_.lookup name --record-types=mask --timeout-us=timeout-us
+    results := query-engine_.lookup name --record-types=mask --timeout-us=timeout-us
+    // Standard IP lookup RPC (LOOKUP-INDEX) is consumed both by Client.dns-lookup
+    // (which accepts raw IP ByteArrays or [type, ip-bytes] pairs) and direct callers
+    // like tests/client_test.toit (which expects [type, ip-bytes] pairs).
+    return results
 
   lookup name/string -> List
       --record-types/int
@@ -296,9 +279,7 @@ class MdnsServiceProvider extends services.ServiceProvider
     return query-engine_.lookup name --record-types=record-types --timeout-us=timeout-us
 
   /**
-  Returns the hostname of the first active manager.
-  This is primarily for debugging purposes.
-  To get the hostname for a specific client context, use $connect-locally or the RPC interface.
+  Returns the hostname of the first active manager (primarily for diagnostics).
   */
   hostname -> string:
     if managers_.is-empty: return "no-active-check"
@@ -313,6 +294,7 @@ class MdnsServiceProvider extends services.ServiceProvider
 class DirectMdnsService_ implements MdnsService:
   provider_/MdnsServiceProvider
   client-id_/int
+  closed_/bool := false
 
   constructor .provider_ .client-id_:
 
@@ -338,7 +320,6 @@ class DirectMdnsService_ implements MdnsService:
       --hostname/string?=null:
     target := hostname
     if not target: target = provider_.client-commitments_.get client-id_
-    
     provider_.register type port --txt=txt --name=name --hostname=target
 
   get-hostname -> string:
@@ -347,5 +328,7 @@ class DirectMdnsService_ implements MdnsService:
   set-hostname hostname/string -> none:
     provider_.client-set-hostname_ client-id_ hostname
 
-  close:
+  close -> none:
+    if closed_: return
+    closed_ = true
     provider_.on-closed client-id_

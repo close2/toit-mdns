@@ -1,38 +1,37 @@
 # mDNS for Toit
 
-A comprehensive mDNS (Multicast DNS) and DNS-SD (DNS Service Discovery) package for Toit.
-It allows ESP32 devices to resolve `.local` hostnames, discover services, and advertise their own services on the local network.
+A comprehensive mDNS (Multicast DNS, RFC 6762) and DNS-SD (DNS Service Discovery, RFC 6763) package for Toit.
+It enables ESP32 and desktop Toit applications to resolve `.local` hostnames, discover services, and advertise their own services on the local network.
 
 ## Features
 
-- **Hostname Resolution**: Resolve `.local` hostnames to IP addresses.
-- **Service Discovery**: Browse for services (e.g., `_http._tcp`) and resolve instances.
-- **Service Registration**: Advertise your own services with PTR, SRV, TXT, and A records.
-- **Caching**: Efficient caching of records to minimize network traffic and latency.
-- **Conflict Resolution**: Handles name conflicts automatically (RFC 6762).
-- **Unicast Responses**: Support for Unicast responses (QU bit) to reduce multicast traffic.
-- **RFC Compliance**: Implements core "MUST" requirements of RFC 6762 and RFC 6763.
+- **Hostname Resolution**: Resolve `.local` hostnames to IP addresses, including drop-in integration with `net.modules.dns`.
+- **Service Discovery**: Browse for services (e.g., `_http._tcp`) across multiple responders and resolve instances.
+- **Service Registration**: Advertise services with `PTR`, `SRV`, `TXT`, and `A` records, plus `_services._dns-sd._udp.local` enumeration.
+- **Bounded Opt-In Caching**: Caches queried records (and their DNS-SD additionals) with bounded keys and entries to protect ESP32 heap memory.
+- **RFC-Compliant Probing & Defense**: Probing with jitter, pairwise lexicographic tiebreaking, deferred rate-limited multicast responses, restricted-form `NSEC` negative answers, and voluntary `TTL=0` goodbyes.
+- **Automatic Socket Recovery**: Recovers cleanly if the underlying Wi-Fi / UDP multicast interface resets while active clients are attached.
 
 ## Usage
 
-This package follows a Provider/Client model. The `MdnsServiceProvider` handles the mDNS state machine and networking, while `Client` talks to it.
+This package follows a Provider/Client model: `MdnsServiceProvider` manages the multicast socket, cache, and RFC 6762 state machines, while `Client` communicates with it.
 
-You can run the Provider in two ways:
-1.  **Shared Service (Recommended)**: Run `MdnsServiceProvider` in its own container. Other containers on the device can then share this single instance via `MdnsClient`.
-2.  **Local Usage**: Run `MdnsServiceProvider` directly in your application container.
+You can run the provider in two ways:
+1. **Shared Service (Recommended for multi-container devices)**: Run `MdnsServiceProvider` in its own container so multiple applications share a single socket and cache via RPC.
+2. **In-Process Usage**: Use `LocalMdnsClient` to run an isolated provider inside your application container.
 
 ### Option 1: Shared Service
 
 **1. Install Provider**
 
-Create a file `mdns-provider.toit`:
+Create `mdns-provider.toit`:
 
 ```toit
-import mdns.service
+import mdns.service show MdnsServiceProvider
 
 main:
-  service := service.MdnsServiceProvider
-  service.install
+  provider := MdnsServiceProvider
+  provider.install
 ```
 
 Install it on your device:
@@ -43,95 +42,71 @@ jag container install mdns mdns-provider.toit
 
 **2. Use Client**
 
-In your other applications, simply use the client:
-
 ```toit
 import mdns.client show Client
 
 main:
-  client := Client
-  // client.dns-lookup / client.register-service / client.browse
+  client := Client --hostname="my-device.local"
+  client.register-service "_http._tcp" 8080 --txt={"path": "/"}
+
+  ip := client.dns-lookup "other-device.local"
+  instances := client.browse "_http._tcp"
 ```
 
-### Option 2: Local Usage
+### Option 2: In-Process Usage (`LocalMdnsClient`)
 
-If you don't want to run a separate container, you can start the service directly in your app.
-
-> [!NOTE]
-> `MdnsServiceProvider` is a `ServiceProvider` and will register itself as the system's mDNS service provider upon instantiation. Be aware of this if you are running multiple instances or want to avoid global service registration.
+If you do not run a separate `mdns` container, `LocalMdnsClient` creates an in-process `MdnsServiceProvider` via `connect-locally` (without calling `.install` on the global system service registry):
 
 ```toit
-import mdns.client show Client LocalMdnsClient
+import mdns.client show LocalMdnsClient
+import net.modules.dns
 
 main:
-  // Create a client that manages its own local mDNS provider
-  client := LocalMdnsClient
-  
-  // Optional: Set as default mDNS resolver for the SDK
-  // dns.default-mdns-client = client.dns-client
+  client := LocalMdnsClient --hostname="my-device.local"
 
-  // Use the client as normal
-  client.register-service "_http._tcp" 8080 
-      --name="MyDevice" 
+  // Optional: set as the SDK's default .local mDNS resolver.
+  dns.default-mdns-client = client.dns-client
+
+  client.register-service "_http._tcp" 8080
+      --name="MyDevice"
       --txt={"path": "/"}
-      
-  // ... when done, close the client to stop the service
+
+  // When done, close the client to send goodbye packets and stop the provider:
   // client.close
 ```
 
-### Publishing Device Name
+### Publishing a Device Name
 
-Each client connection manages its own requested hostname. The service announces a hostname only while at least one client is requesting it (reference counted). 
-
-By default, a client requests `toit-device.local` (or similar system default). You can change this using `set-hostname`.
+Each client connection manages its own requested hostname (reference-counted by the provider). When `client.close` is called (or the client container exits), its reference is released and `TTL=0` goodbye records are sent once the reference count reaches zero.
 
 ```toit
 import mdns.client show Client
 
 main:
   client := Client
-  client.set-hostname "my-cool-device.local" 
-  
-  // The service will now probe and announce "my-cool-device.local".
-  // If the client disconnects or the app exits, the hostname is released.
+  client.set-hostname "my-cool-device.local"
 ```
 
 ## RFC Compliance
 
 This implementation targets RFC 6762 (mDNS) and RFC 6763 (DNS-SD).
 
-| Feature                      | RFC  | Status        | Notes                                              |
-|:-----------------------------|:-----|:--------------|:---------------------------------------------------|
-| **Probing**                  | 6762 | ✅ Implemented | 3 probes, 250ms apart, random jitter, tiebreaking. |
-| **Announcing**               | 6762 | ✅ Implemented | 2 unsolicited responses, 1s apart (§8.3).          |
-| **Conflict Resolution**      | 6762 | ✅ Implemented | Defends, renames, 15-conflict rate limiting.       |
-| **Response Generation**      | 6762 | ✅ Implemented | Correct TTLs, AA bit, record aggregation.          |
-| **Known-Answer Suppression** | 6762 | ✅ Implemented | Suppresses when TTL ≥ 50% (§7.1).                  |
-| **Unicast Responses**        | 6762 | ✅ Implemented | QU bit handling.                                   |
-| **Message Validation**       | 6762 | ✅ Implemented | Rejects non-zero OPCODE/RCODE (§18).               |
-| **Source Port Check**        | 6762 | ✅ Implemented | Rejects responses not from port 5353 (§6.10).      |
-| **Response Rate Limiting**   | 6762 | ✅ Implemented | Max 1 multicast/second (§6.16).                    |
-| **Probe Tiebreaking**        | 6762 | ✅ Implemented | Authority Section comparison (§8.2).               |
-| **NSEC Negative Responses**  | 6762 | ❌ Not impl.   | Unique-name NSEC records not yet generated.        |
-| **Truncated Packets (TC)**   | 6762 | ❌ Not impl.   | Multi-packet Known-Answer not supported.           |
-| **Service Registration**     | 6763 | ✅ Implemented | PTR, SRV, TXT, A records.                          |
-| **Service Enumeration**      | 6763 | ✅ Implemented | Browsing via generic PTR queries.                  |
-| **Service Resolution**       | 6763 | ✅ Implemented | Resolving Service Instance Names.                  |
-| **TXT Record Strings**       | 6763 | ✅ Implemented | Multiple key-value pairs (RFC 1035).               |
-| **Subtypes**                 | 6763 | ❌ Not impl.   | Browsing by subtype not supported.                 |
-
-## Why use `Client`?
-
-The `Client` provided by this package is the recommended way to interact with mDNS on Toit.
-
-While Toit's `net` library can resolve `.local` names it only implements one-shot queries.
-
-The Client can also be set as default dns client for `.local` requests, rather than relying on one-shot queries.
-```toit
-import mdns.client show Client
-
-client := Client
-dns.default-mdns-client = client.dns-client
-```
-
-The background `MdnsServiceProvider` continuously listens to the multicast group. It maintains a cache of the network state, meaning lookups can often be answered instantly without waiting for a network query.
+| Feature                      | RFC  | Status        | Notes                                                               |
+|:-----------------------------|:-----|:--------------|:--------------------------------------------------------------------|
+| **Probing**                  | 6762 | ✅ Implemented | 3 probes (QU), 250ms apart, 0–250ms jitter, 15-conflict rate limit. |
+| **Probe Tiebreaking**        | 6762 | ✅ Implemented | Sorted `(class, type, rdata)` Authority Section comparison (§8.2).  |
+| **Announcing & Goodbyes**    | 6762 | ✅ Implemented | 2 announcements 1s apart (§8.3) + voluntary `TTL=0` goodbyes (§10.1). |
+| **Conflict Resolution**      | 6762 | ✅ Implemented | Defends established names/services and renames on persistent conflict (§9). |
+| **Response Generation**      | 6762 | ✅ Implemented | Correct TTLs, `AA` bit, `cache-flush`, deduplicated aggregation.    |
+| **Known-Answer Suppression** | 6762 | ✅ Implemented | Suppresses answers when query carries matching RR with TTL ≥ 50% (§7.1). |
+| **Unicast Responses**        | 6762 | ✅ Implemented | `QU` bit (quarter-TTL rule) and legacy unicast responses (§5.4, §6.7). |
+| **Message Validation**       | 6762 | ✅ Implemented | Rejects non-zero `OPCODE`/`RCODE`, ignores `Z`/`AD`/`CD` (§18).     |
+| **Source Port Check**        | 6762 | ✅ Implemented | Rejects responses not from port 5353 in responder & querier (§6.10). |
+| **Response Rate Limiting**   | 6762 | ✅ Implemented | Deferred multicast scheduling: max 1/s (250ms on probe defense, §6). |
+| **NSEC Negative Responses**  | 6762 | ✅ Implemented | Restricted-form `NSEC` for unique host & service names (§6.1).      |
+| **Truncated Packets (TC)**   | 6762 | ❌ Not impl.   | Multi-packet Known-Answer continuations not supported.              |
+| **Service Registration**     | 6763 | ✅ Implemented | `PTR`, `SRV`, `TXT`, `A`, and `_services._dns-sd._udp.local` (§9).  |
+| **Service Enumeration**      | 6763 | ✅ Implemented | Multi-responder `PTR` browsing with aggregation & Known-Answers.    |
+| **Service Resolution**       | 6763 | ✅ Implemented | Resolving Service Instance Names (`SRV` + `TXT` + `A`).             |
+| **TXT Record Strings**       | 6763 | ✅ Implemented | Multi-key, boolean/valueless, and binary `<character-string>` support (§6). |
+| **Subtypes**                 | 6763 | ❌ Not impl.   | Browsing by `_sub` subtype not supported.                           |
