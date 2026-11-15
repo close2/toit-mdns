@@ -32,7 +32,11 @@ jobs:
             sudo route add -net 224.0.0.0 netmask 240.0.0.0 dev lo || true
           elif [ "${{ runner.os }}" = "macOS" ]; then
             sudo ifconfig lo0 up
-            sudo route -n add -net 224.0.0.0/4 -interface lo0 || true
+            # Newer macOS images ship a pre-existing 224.0.0.0/4 route, so
+            # replace it (instead of adding) to send multicast via lo0.
+            sudo route -n delete -net 224.0.0.0/4 || true
+            sudo route -n add -net 224.0.0.0/4 -interface lo0
+            netstat -rn -f inet | grep -E '^(224|Destination)' || true
           fi
 
       - name: Test
