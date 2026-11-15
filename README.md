@@ -110,3 +110,19 @@ This implementation targets RFC 6762 (mDNS) and RFC 6763 (DNS-SD).
 | **Service Resolution**       | 6763 | ✅ Implemented | Resolving Service Instance Names (`SRV` + `TXT` + `A`).             |
 | **TXT Record Strings**       | 6763 | ✅ Implemented | Multi-key, boolean/valueless, and binary `<character-string>` support (§6). |
 | **Subtypes**                 | 6763 | ❌ Not impl.   | Browsing by `_sub` subtype not supported.                           |
+
+## Why use `Client`?
+
+The `Client` provided by this package is the recommended way to interact with mDNS on Toit.
+
+While Toit's `net` library can resolve `.local` names it only implements one-shot queries.
+
+The Client can also be set as default dns client for `.local` requests, rather than relying on one-shot queries.
+```toit
+import mdns.client show Client
+
+client := Client
+dns.default-mdns-client = client.dns-client
+```
+
+The background `MdnsServiceProvider` continuously listens to the multicast group. It maintains a cache of the network state, meaning lookups can often be answered instantly without waiting for a network query.

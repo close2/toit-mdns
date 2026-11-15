@@ -49,14 +49,6 @@ class ConflictManager:
     num-suffix := "-$next-number"
     max-base-len := MAX-DNS-LABEL-OCTETS_ - num-suffix.size
     if base-name.size > max-base-len:
-      base-name = truncate-utf8_ base-name max-base-len
+      base-name = dns-helper.truncate-utf8 base-name max-base-len
 
     return "$base-name$num-suffix$suffix"
-
-  static truncate-utf8_ s/string max-bytes/int -> string:
-    if s.size <= max-bytes: return s
-    end := max-bytes
-    // Step back over UTF-8 continuation bytes (0b10xxxxxx) so we never split a rune.
-    while end > 0 and ((s.at --raw end) & 0xc0) == 0x80:
-      end--
-    return s[..end]

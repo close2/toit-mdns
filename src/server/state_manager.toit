@@ -755,7 +755,7 @@ class StateManager:
           list.add (prefix + clipped)
       else:
         entry := "$key-str=$v"
-        if entry.size > 255: entry = entry[..255]
+        entry = dns.truncate-utf8 entry 255
         list.add entry
     return list.is-empty ? [""] : list
 

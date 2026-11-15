@@ -37,6 +37,7 @@ main:
   test-all-nonzero-opcodes-rejected
   test-corrupt-rdata-throws
   test-multi-and-binary-txt-roundtrip
+  test-hostname-case-preserved
   test-goodbye-evicts-flushed-cache-entry
   test-conflict-manager-63-octet-and-case
   test-service-reconnect-dedup-after-rename
@@ -140,7 +141,31 @@ test-multi-and-binary-txt-roundtrip:
   expect (decoded-txt.text.contains "ver=2")
   expect (decoded-txt.text.contains "flag")
   expect (decoded-txt.text.contains "empty")
+  // Binary (non-UTF-8) values must survive the round-trip byte-exact.
+  bin-entry := decoded-txt.text.filter: it is ByteArray
+  expect-equals 1 bin-entry.size
+  expect-equals ("bin=".to-byte-array + #[0xff, 0x00, 0x41]) bin-entry[0]
+
+  // Long multi-byte values must be clamped to 255 octets without splitting a rune.
+  long-entries := sm.build-txt-list_ {"k": "é" * 200}
+  expect-equals 1 long-entries.size
+  expect (long-entries[0].size <= 255)
+  expect (long-entries[0].to-byte-array.is-valid-string-content)
   print "  PASS"
+
+test-hostname-case-preserved:
+  print "Test: Provider preserves hostname case (RFC 6762 §16)..."
+  provider := MdnsServiceProvider --port=TEST-PORT + 4
+  try:
+    provider.handle MdnsService.SET-HOSTNAME-INDEX "MyDevice.local" --client=1 --gid=0
+    expect-equals "MyDevice.local"
+        provider.handle MdnsService.GET-HOSTNAME-INDEX null --client=1 --gid=0
+    // A second client using a different case shares the same manager.
+    provider.handle MdnsService.SET-HOSTNAME-INDEX "mydevice.LOCAL" --client=2 --gid=0
+    expect-equals 1 provider.managers_.size
+    print "  PASS"
+  finally:
+    provider.close
 
 test-goodbye-evicts-flushed-cache-entry:
   print "Test: Goodbye (TTL=0, flush=false) expires cached flush=true record..."

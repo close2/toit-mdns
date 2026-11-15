@@ -107,7 +107,7 @@ class MdnsServiceProvider extends services.ServiceProvider
       decrement-ref_ old-key
 
     client-commitments_[client] = key
-    increment-ref_ key
+    increment-ref_ key name
 
   client-get-hostname_ client/int -> string:
     committed-key := client-commitments_.get client
@@ -116,13 +116,21 @@ class MdnsServiceProvider extends services.ServiceProvider
     if not manager: throw "Manager not found for $committed-key"
     return manager.hostname
 
-  increment-ref_ key/string -> none:
+  /**
+  Increments the reference count for the lowercased $key, creating a
+    manager for $name if needed.
+
+  The manager is created with $name (not $key) so that the advertised
+    hostname and derived default service-instance names preserve the
+    caller's case (RFC 6762 §16).
+  */
+  increment-ref_ key/string name/string -> none:
     refs := manager-refs_.get key --init=(: 0)
     manager-refs_[key] = refs + 1
 
     if not managers_.contains key:
       cm := ConflictManager
-      manager := StateManager socket_ cm key resolved-local-ip_ --expected-port=port
+      manager := StateManager socket_ cm name resolved-local-ip_ --expected-port=port
       managers_[key] = manager
       manager.start
 
@@ -152,6 +160,9 @@ class MdnsServiceProvider extends services.ServiceProvider
     if socket_ and not socket_.is-closed: return
     open-socket-and-bind_
 
+    // If the receive loop is still alive (e.g. backing off after a socket
+    // error), it picks up the new $socket_ itself; don't start a second one.
+    if receive-task_: return
     receive-task_ = task::
       try:
         receive-loop_
@@ -233,7 +244,10 @@ class MdnsServiceProvider extends services.ServiceProvider
 
         // If no managers or active queries remain, exit cleanly and let the
         // next client request re-initialize lazily via ensure-socket_.
-        if managers_.is-empty and (not query-engine_ or not query-engine_.has-pending):
+        // Re-check $socket_: a concurrent $ensure-socket_ may already have
+        // reopened it while we were logging/closing, relying on this loop.
+        if not socket_ and managers_.is-empty and
+            (not query-engine_ or not query-engine_.has-pending):
           return
 
         backoff-ms := 1000

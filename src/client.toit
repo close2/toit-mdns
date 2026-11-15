@@ -89,6 +89,7 @@ class Client:
   Returns:
   - $net.IpAddress instances for `RECORD-A` / `RECORD-AAAA`
   - `string` values for `RECORD-PTR`, `RECORD-CNAME`, and `RECORD-TXT`
+    (binary, non-UTF-8 `TXT` character-strings are returned as $ByteArray)
   - $dns.SrvResource instances for `RECORD-SRV`
   */
   dns-lookup name/string -> List
@@ -110,10 +111,11 @@ class Client:
       if type == dns.RECORD-A or type == dns.RECORD-AAAA:
         parsed.add (net.IpAddress data)
       else if type == dns.RECORD-TXT:
+        // Binary (non-UTF-8) character-strings are returned as `ByteArray`.
         if data is List:
-          data.do: parsed.add it.to-string
+          data.do: parsed.add (txt-entry_ it)
         else if data != null:
-          parsed.add data.to-string
+          parsed.add (txt-entry_ data)
       else if type == dns.RECORD-PTR or type == dns.RECORD-CNAME:
         parsed.add data.to-string
       else if type == dns.RECORD-SRV:
@@ -121,6 +123,12 @@ class Client:
           parsed.add (dns.SrvResource name type 0 false data[3] data[0] data[1] data[2])
 
     return parsed
+
+  static txt-entry_ entry -> any:
+    if entry is ByteArray:
+      bytes := entry as ByteArray
+      return bytes.is-valid-string-content ? bytes.to-string : bytes
+    return entry.to-string
 
   /**
   Browses for DNS-SD services of $type (for example `"_http._tcp"`),

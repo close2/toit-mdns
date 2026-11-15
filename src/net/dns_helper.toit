@@ -165,8 +165,10 @@ decode-resource_ reader/io.Reader packet/ByteArray name-cache/Map -> dns.Resourc
       str-len := reader.read-byte
       remaining--
       if str-len > remaining: throw "CORRUPT_TXT_RECORD"
-      chunk := (reader.read-bytes str-len).to-string-non-throwing
-      strings.add chunk
+      // RFC 6763 §6.5: TXT values may contain arbitrary binary data. Keep
+      // valid UTF-8 as `string` and preserve anything else as raw `ByteArray`.
+      bytes := reader.read-bytes str-len
+      strings.add (bytes.is-valid-string-content ? bytes.to-string : bytes)
       remaining -= str-len
     result = dns.TxtResource r-name ttl flush strings
   else if type == dns.RECORD-SRV:
@@ -435,6 +437,17 @@ name-equals a/string b/string -> bool:
     if 'A' <= cb <= 'Z': cb += 'a' - 'A'
     if ca != cb: return false
   return true
+
+/**
+Truncates $s to at most $max-bytes octets without splitting a UTF-8 rune.
+*/
+truncate-utf8 s/string max-bytes/int -> string:
+  if s.size <= max-bytes: return s
+  end := max-bytes
+  // Step back over UTF-8 continuation bytes (0b10xxxxxx) so we never split a rune.
+  while end > 0 and ((s.at --raw end) & 0xc0) == 0x80:
+    end--
+  return s[..end]
 
 /**
 Returns true if $name has a non-empty prefix followed by `.local`
