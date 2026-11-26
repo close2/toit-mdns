@@ -113,10 +113,7 @@ class QueryEngine:
   process-packet packet/dns.DecodedPacket -> none:
     if pending_.is-empty: return
 
-    if is-relevant-packet_ packet:
-      add-all_ packet.resources
-      add-all_ packet.additionals
-      add-all_ packet.authorities
+    if not (cache-relevant-records_ packet): return
 
     pending_.do: | name/string listeners/List |
       listeners.do: | query/PendingQuery_ |
@@ -127,19 +124,51 @@ class QueryEngine:
           else if not query.shared and (is-negatively-cached_ name query.record-types):
             query.latch.set []
 
-  is-relevant-packet_ packet/dns.DecodedPacket -> bool:
-    return contains-pending-name_ packet.resources or
-        contains-pending-name_ packet.additionals or
-        contains-pending-name_ packet.authorities
+  cache-relevant-records_ packet/dns.DecodedPacket -> bool:
+    level1 := []
+    any-relevant := false
+    do-packet-resources_ packet: | res/dns.Resource |
+      if is-pending-name_ res.name:
+        any-relevant = true
+        target := target-of-link_ res
+        if target and not (name-in-list_ level1 target):
+          level1.add target
+    if not any-relevant: return false
 
-  contains-pending-name_ resources/List -> bool:
-    resources.do: | res/dns.Resource |
-      if pending_.contains res.name.to-ascii-lower: return true
+    level2 := []
+    if not level1.is-empty:
+      do-packet-resources_ packet: | res/dns.Resource |
+        if name-in-list_ level1 res.name:
+          target := target-of-link_ res
+          if target and not (name-in-list_ level2 target):
+            level2.add target
+
+    do-packet-resources_ packet: | res/dns.Resource |
+      if (is-pending-name_ res.name) or (name-in-list_ level1 res.name) or (name-in-list_ level2 res.name):
+        cache_.add res
+    return true
+
+  do-packet-resources_ packet/dns.DecodedPacket [block] -> none:
+    packet.resources.do block
+    packet.additionals.do block
+    packet.authorities.do block
+
+  is-pending-name_ name/string -> bool:
+    pending_.do: | pending-name/string _ |
+      if dns-helper.name-equals pending-name name: return true
     return false
 
-  add-all_ resources/List -> none:
-    resources.do: | res/dns.Resource |
-      cache_.add res
+  static name-in-list_ names/List target/string -> bool:
+    names.do: | item/string |
+      if dns-helper.name-equals item target: return true
+    return false
+
+  static target-of-link_ res/dns.Resource -> string?:
+    if res is dns.SrvResource:
+      return (res as dns.SrvResource).value
+    if (res.type == dns.RECORD-PTR or res.type == dns.RECORD-CNAME) and res is dns.StringResource:
+      return (res as dns.StringResource).value
+    return null
 
   maybe-send-query_ name/string record-types/int now/int -> none:
     if socket_.is-closed: return

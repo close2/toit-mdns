@@ -42,6 +42,7 @@ class MdnsServiceProvider extends services.ServiceProvider
   group/net.IpAddress
   port/int
   local-ip/net.IpAddress?
+  cache-max-bytes/int
   resolved-local-ip_/net.IpAddress? := null
 
   local-client-counter_/int := -1
@@ -50,7 +51,8 @@ class MdnsServiceProvider extends services.ServiceProvider
   constructor
       --.port/int=MDNS-PORT
       --.group/net.IpAddress=MDNS-MULTICAST-ADDRESS
-      --.local-ip/net.IpAddress?=null:
+      --.local-ip/net.IpAddress?=null
+      --.cache-max-bytes/int=MdnsCache.DEFAULT-MAX-BYTES:
     super "mdns" --major=1 --minor=0
     provides MdnsService.SELECTOR --handler=this
 
@@ -180,7 +182,7 @@ class MdnsServiceProvider extends services.ServiceProvider
       socket_ = new-socket
       resolved-local-ip_ = local-ip or network.address
 
-      if not cache_: cache_ = MdnsCache
+      if not cache_: cache_ = MdnsCache --max-bytes=cache-max-bytes
       if query-engine_:
         query-engine_.update-socket socket_
       else:
@@ -209,7 +211,12 @@ class MdnsServiceProvider extends services.ServiceProvider
         // - RFC 6762 §6.10: Ignore responses not originating from port 5353.
         if not dns.is-valid-raw-mdns-header packet-bytes: continue
         is-response := (packet-bytes[2] & 0x80) != 0
-        if is-response and datagram.address.port != port: continue
+        if is-response:
+          if datagram.address.port != port: continue
+          if managers_.is-empty and (not query-engine_ or not query-engine_.has-pending):
+            continue
+        else:
+          if managers_.is-empty: continue
 
         decoded/dns.DecodedPacket? := null
         parse-exception := catch:

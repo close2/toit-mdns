@@ -72,6 +72,13 @@ class StateManager:
 
   services_/List := []  // List<RegisteredService>
 
+  host-a-probe_/dns.AResource? := null
+  host-a-120_/dns.AResource? := null
+  host-a-10_/dns.AResource? := null
+  host-goodbye_/dns.AResource? := null
+  host-a-rate-key_/string := ""
+  host-nsec-rate-key_/string := ""
+
   /** Number of registered services. Exposed for tests. */
   services-count -> int:
     return services_.size
@@ -84,6 +91,16 @@ class StateManager:
     assert: names.validate-hostname hostname
     hostname_ = hostname
     expected-port_ = expected-port
+    rebuild-host-records_
+
+  rebuild-host-records_ -> none:
+    lower := hostname_.to-ascii-lower
+    host-a-probe_ = dns.AResource hostname_ 120 local-ip_
+    host-a-120_ = dns.AResource hostname_ 120 local-ip_ --flush
+    host-a-10_ = dns.AResource hostname_ 10 local-ip_
+    host-goodbye_ = dns.AResource hostname_ 0 local-ip_
+    host-a-rate-key_ = "$lower:$(dns.RECORD-A)"
+    host-nsec-rate-key_ = "$lower:$(dns.RECORD-NSEC)"
 
   /**
   Updates the socket and local IP after a network interface recovery and
@@ -92,6 +109,7 @@ class StateManager:
   update-network socket/MdnsSocket local-ip/net.IpAddress -> none:
     socket_ = socket
     local-ip_ = local-ip
+    rebuild-host-records_
     cancel-deferred-multicast_
     if not stopped_: enter-probing_
 
@@ -174,6 +192,7 @@ class StateManager:
     if not stopped_ and (state_ == STATE-ANNOUNCING or state_ == STATE-ESTABLISHED):
       send-host-goodbye_ hostname_
     hostname_ = new-hostname
+    rebuild-host-records_
     cancel-deferred-multicast_
     enter-probing_
 
@@ -191,7 +210,7 @@ class StateManager:
 
     // --- Simultaneous Probe Tiebreaking (RFC 6762 §8.2) ---
     if state_ == STATE-PROBING and dns.is-probe-for decoded hostname_:
-      our-host-records := [dns.AResource hostname_ 120 local-ip_]
+      our-host-records := [host-a-probe_]
       cmp := dns.compare-probe-tiebreak our-host-records decoded.authorities hostname_
       if cmp != null and cmp < 0:
         log.info "Probe tiebreak lost, deferring" --tags={"hostname": hostname_}
@@ -320,6 +339,7 @@ class StateManager:
     if probe-timer_: probe-timer_.cancel
     record-conflict_
     hostname_ = conflict-manager_.resolve-probing-conflict hostname_
+    rebuild-host-records_
     enter-probing_
 
   handle-established-conflict_ -> none:
@@ -336,6 +356,7 @@ class StateManager:
       log.warn "Conflict persistence detected. Renaming..." --tags={"hostname": hostname_}
       record-conflict_
       hostname_ = conflict-manager_.resolve-established-conflict hostname_
+      rebuild-host-records_
       enter-probing_
 
   handle-service-conflict_ i/int -> none:
@@ -384,7 +405,7 @@ class StateManager:
     groups := [
       [
         [dns.Question hostname_ dns.RECORD-ANY --unicast-ok],
-        [dns.AResource hostname_ 120 local-ip_],
+        [host-a-probe_],
       ],
     ]
     services_.do: | s/RegisteredService |
@@ -427,7 +448,7 @@ class StateManager:
       send-raw_ --queries=batch-q --records=[] --no-is-response --authorities=batch-auth
 
   build-full-announcement-records_ -> List:
-    answers := [dns.AResource hostname_ 120 local-ip_ --flush]
+    answers := [host-a-120_]
     services_.do: | s/RegisteredService |
       answers.add (dns.StringResource s.type-domain dns.RECORD-PTR 4500 false s.full-name)
       answers.add (dns.SrvResource s.full-name dns.RECORD-SRV 120 true hostname_ 0 0 s.port)
@@ -449,7 +470,7 @@ class StateManager:
 
   send-goodbye_ -> none:
     if socket_.is-closed: return
-    records := [dns.AResource hostname_ 0 local-ip_]
+    records := [host-goodbye_]
     services_.do: | s/RegisteredService |
       records.add (dns.StringResource s.type-domain dns.RECORD-PTR 0 false s.full-name)
       records.add (dns.SrvResource s.full-name dns.RECORD-SRV 0 false hostname_ 0 0 s.port)
@@ -479,6 +500,10 @@ class StateManager:
     return (now - last) < (ttl-s * 250_000)
 
   record-rate-key_ rec/dns.Resource -> string:
+    if rec.type == dns.RECORD-A and (dns.name-equals rec.name hostname_):
+      return host-a-rate-key_
+    if rec.type == dns.RECORD-NSEC and (dns.name-equals rec.name hostname_):
+      return host-nsec-rate-key_
     owner := rec.name.to-ascii-lower
     if rec.type == dns.RECORD-PTR and rec is dns.StringResource:
       return "$owner:$(rec.type):$((rec as dns.StringResource).value.to-ascii-lower)"
@@ -502,9 +527,7 @@ class StateManager:
     // 1. Hostname A record + restricted-form NSEC for unsupported types (e.g. AAAA).
     q-host := find-question_ query hostname_ dns.RECORD-A
     if q-host:
-      host-answer := legacy-query
-          ? dns.AResource hostname_ 10 local-ip_
-          : dns.AResource hostname_ 120 local-ip_ --flush
+      host-answer := legacy-query ? host-a-10_ : host-a-120_
       if not query or not dns.has-known-answer query hostname_ dns.RECORD-A 120 --record=host-answer:
         // Probe defenses are always multicast so co-hosted SO_REUSEPORT sockets
         // and LAN peers reliably observe the defense (RFC 6762 §6 / §8).
@@ -513,7 +536,7 @@ class StateManager:
                 (was-multicast-within-quarter-ttl_ host-answer 120 now))
         add-unique-record_ (use-unicast ? unicast-answers : multicast-answers) host-answer
     else if not query:
-      add-unique-record_ multicast-answers (dns.AResource hostname_ 120 local-ip_ --flush)
+      add-unique-record_ multicast-answers host-a-120_
 
     q-host-neg := find-negative-question_ query hostname_ [dns.RECORD-A]
     if q-host-neg:
@@ -565,7 +588,7 @@ class StateManager:
           // RFC 6763 §12.1: Include SRV, TXT, and A in the Additional Record Section.
           add-unique-record_ add-target (dns.SrvResource s.full-name dns.RECORD-SRV srv-ttl additional-flush hostname_ 0 0 s.port)
           add-unique-record_ add-target (dns.TxtResource s.full-name txt-ttl additional-flush (build-txt-list_ s.txt))
-          add-unique-record_ add-target (dns.AResource hostname_ host-ttl local-ip_ --flush=additional-flush)
+          add-unique-record_ add-target (legacy-query ? host-a-10_ : host-a-120_)
 
       q-srv := find-question_ query s.full-name dns.RECORD-SRV
       q-txt := find-question_ query s.full-name dns.RECORD-TXT
@@ -588,7 +611,7 @@ class StateManager:
           if want-srv: add-unique-record_ ans-target srv-rec
           if want-txt: add-unique-record_ ans-target txt-rec
           // RFC 6763 §12.2: Include target host address in the Additional Record Section.
-          add-unique-record_ add-target (dns.AResource hostname_ host-ttl local-ip_ --flush=additional-flush)
+          add-unique-record_ add-target (legacy-query ? host-a-10_ : host-a-120_)
 
       q-srv-neg := find-negative-question_ query s.full-name [dns.RECORD-SRV, dns.RECORD-TXT]
       if q-srv-neg:
@@ -812,11 +835,13 @@ class RegisteredService:
   instance-name/string
   port/int
   txt/Map?
+  full-name/string
+  type-domain/string
+  full-name-lower/string
+  type-domain-lower/string
 
   constructor .type .original-instance-name .instance-name .port .txt:
-
-  full-name -> string:
-    return "$(instance-name).$(type).local"
-
-  type-domain -> string:
-    return "$(type).local"
+    full-name = "$(instance-name).$(type).local"
+    type-domain = "$(type).local"
+    full-name-lower = full-name.to-ascii-lower
+    type-domain-lower = type-domain.to-ascii-lower

@@ -9,12 +9,14 @@ Each case asserts the *correct* behavior. Cases whose fix has not landed yet
 
 import net
 import net.modules.dns
+import system
 import mdns.api.mdns-service show MdnsService
 import mdns.client show Client
 import mdns.net.dns-helper as dns-helper
 import mdns.net.mdns-socket show MdnsSocket
 import mdns.server.cache show MdnsCache
 import mdns.server.conflict-manager show ConflictManager
+import mdns.server.query-engine show QueryEngine
 import mdns.server.state-manager show StateManager
 import mdns.service show MdnsServiceProvider
 
@@ -25,8 +27,6 @@ import .support.capture
 KNOWN-FAILING ::= {
   "c1-aaaa-is-not-a-conflict",           // P3.
   "c2-established-conflict-reprobes",    // P3.
-  "s1-cache-byte-budget",                // P2.
-  "s2-nsec-bitmap-bounded",              // P2.
   "s4-cross-hostname-denied",            // P4.
   "s4-no-hijack-on-shared-hostname",     // P4.
   "f2-services-removed-on-close",        // P4.
@@ -48,7 +48,10 @@ main:
   check "f1-invalid-names-rejected": test-invalid-names-rejected it
   check "f3-dotted-instance-rejected": test-dotted-instance-rejected it
   check "s1-cache-byte-budget": test-cache-byte-budget it
+  check "s1-narrow-caching-drops-unrelated": test-narrow-caching-drops-unrelated it
   check "s2-nsec-bitmap-bounded": test-nsec-bitmap-bounded it
+  check "s2-nsec-rejects-non-increasing-windows": test-nsec-rejects-non-increasing-windows it
+  check "p2-low-alloc-packet-processing": test-process-packet-low-alloc it
   check "s4-cross-hostname-denied": test-cross-hostname-denied it
   check "s4-no-hijack-on-shared-hostname": test-no-hijack-on-shared-hostname it
   check "f2-services-removed-on-close": test-services-removed-on-close it
@@ -230,6 +233,35 @@ test-cache-byte-budget port/int:
     entries.do: | entry |
       (entry.record as dns.TxtResource).text.do: payload += it.size
   assert-true_ payload <= 16_384 --message="cache retains $payload bytes of TXT payload"
+  assert-true_ cache.bytes <= 16_384 --message="cache.bytes $cache.bytes exceeds 16384"
+
+test-narrow-caching-drops-unrelated port/int:
+  socket := MdnsSocket --network=net.open --port=port
+  cache := MdnsCache
+  engine := QueryEngine socket cache
+  try:
+    t := task::
+      engine.lookup "_http._tcp.local" --record-types=dns.RECORD-PTR --timeout-us=1_500_000
+    sleep --ms=50  // Wait until lookup is registered in pending_.
+    // Packet carries: PTR for _http._tcp.local -> app._http._tcp.local,
+    // SRV for app -> app.local, A for app.local, AND unrelated spam.local.
+    pkt := dns-helper.encode-mdns-packet [] [
+      dns.StringResource "_http._tcp.local" dns.RECORD-PTR 4500 false "app._http._tcp.local",
+    ] --is-response --additionals=[
+      dns.SrvResource "app._http._tcp.local" dns.RECORD-SRV 120 true "app.local" 0 0 8080,
+      dns.AResource "app.local" 120 (net.IpAddress.parse "10.0.0.5") --flush,
+      dns.TxtResource "spam.local" 4500 false ["k=" + ("x" * 200)],
+      dns.AResource "spam.local" 120 (net.IpAddress.parse "10.0.0.99") --flush,
+    ]
+    engine.process-packet (dns-helper.parse pkt)
+    sleep --ms=450  // Wait for browse aggregation to finish.
+    assert-equals_ 1 (cache.lookup "_http._tcp.local" dns.RECORD-PTR).size
+    assert-equals_ 1 (cache.lookup "app._http._tcp.local" dns.RECORD-SRV).size
+    assert-equals_ 1 (cache.lookup "app.local" dns.RECORD-A).size
+    assert-equals_ 0 (cache.lookup "spam.local" dns.RECORD-TXT).size
+    assert-equals_ 0 (cache.lookup "spam.local" dns.RECORD-A).size
+  finally:
+    socket.close
 
 test-nsec-bitmap-bounded port/int:
   rdata := #[0xc0, 12]
@@ -242,6 +274,32 @@ test-nsec-bitmap-bounded port/int:
   nsec := decoded.resources[0] as dns-helper.NsecResource
   assert-true_ nsec.types.size <= 256 --message="NSEC decoded to $nsec.types.size entries"
   assert-true_ (nsec.has-type dns.RECORD-A)
+
+test-nsec-rejects-non-increasing-windows port/int:
+  // Window 1 followed by window 0 violates RFC 4034 §4.1.2.
+  rdata := #[0xc0, 12, 1, 1, 0x80, 0, 1, 0x40]
+  header := #[0, 0, 0x84, 0, 0, 0, 0, 1, 0, 0, 0, 0]
+  owner := #[4] + "evil".to-byte-array + #[5] + "local".to-byte-array + #[0]
+  fixed := #[0, 47, 0, 1, 0, 0, 0, 120, rdata.size >> 8, rdata.size & 0xff]
+  expect-throws: dns-helper.parse header + owner + fixed + rdata
+
+test-process-packet-low-alloc port/int:
+  with-manager port "alloc-host.local": | manager/StateManager _ |
+    3.repeat: | i |
+      manager.register-service "_http._tcp" (8000 + i) --name="svc-$i"
+    manager.start
+    wait-established manager
+    pkt := dns-helper.encode-mdns-packet [dns.Question "unrelated-peer.local" dns.RECORD-A] [] --is-response=false
+    decoded := dns-helper.parse pkt
+    src := net.SocketAddress PEER-IP port
+    // Warm up once, then process 1,000 unrelated queries.
+    manager.process-packet decoded --source=src
+    before := (system.process-stats)[system.STATS-INDEX-BYTES-ALLOCATED-IN-OBJECT-HEAP]
+    1000.repeat:
+      manager.process-packet decoded --source=src
+    after := (system.process-stats)[system.STATS-INDEX-BYTES-ALLOCATED-IN-OBJECT-HEAP]
+    delta := after - before
+    assert-true_ delta < 64_000 --message="1000 unrelated packets allocated $delta bytes"
 
 // --- P4: ownership. ---
 
