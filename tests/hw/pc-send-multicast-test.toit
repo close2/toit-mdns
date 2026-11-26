@@ -3,7 +3,7 @@ PC-side test: sends mDNS multicast packets that an ESP32 on the same
 network should be able to receive.
 
 Run on the development PC with:
-  toit tests/pc-send-multicast-test.toit
+  toit tests/hw/pc-send-multicast-test.toit
 
 While an ESP32 runs the companion esp32-receive-multicast-test.toit,
 use `jag monitor` to check if the ESP32 receives these packets.

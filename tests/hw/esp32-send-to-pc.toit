@@ -1,53 +1,53 @@
 /**
-ESP32 UDP send test using the correct network.udp-open API
-(proxied through the system service).
+Minimal test: send unicast UDP to a specific PC IP and port.
+Also send broadcast. Helps verify ESP32 UDP TX works at all.
 
-Run: build/jag run --device <ESP32-IP> \
-       third_party/toit.worktree1/toit-mdns.v4/tests/esp32-send-proxy.toit
+Run:
+  jag run --device <ESP32-IP> tests/hw/esp32-send-to-pc.toit
 */
 import net
 import net.udp
 
 PC-IP ::= net.IpAddress #[10, 0, 100, 191]
 PC-PORT ::= 7777
-BCAST-ADDR ::= net.IpAddress #[255, 255, 255, 255]
 
 main:
   network := net.open
   my-ip := network.address.stringify
-  print "=== ESP32 UDP proxy-send test ==="
+  print "=== ESP32 UDP send-to-PC test ==="
   print "My IP: $my-ip"
   print "Target: $PC-IP:$PC-PORT"
 
-  // Use network.udp-open (goes through system service proxy on ESP32).
   socket := network.udp-open
   socket.broadcast = true
-  print "Socket opened on port $(socket.local-address.port)"
+  print "Socket created on port $(socket.local-address.port)"
 
   // Send 10 unicast packets to PC.
   10.repeat: | i |
-    payload := "proxy-hello-from-$my-ip-#$i"
+    payload := "hello-from-$my-ip-#$i"
     exception := catch:
       socket.send
           udp.Datagram
               payload.to-byte-array
               net.SocketAddress PC-IP PC-PORT
     if exception:
-      print "UNICAST ERROR [$i]: $exception"
+      print "UNICAST SEND ERROR [$i]: $exception"
     else:
       print "UNICAST SENT [$i]: $payload"
     sleep --ms=500
 
-  // 3 broadcast packets.
+  // Also try broadcast.
   3.repeat: | i |
-    payload := "proxy-bcast-from-$my-ip-#$i"
+    payload := "bcast-from-$my-ip-#$i"
     exception := catch:
       socket.send
           udp.Datagram
               payload.to-byte-array
-              net.SocketAddress BCAST-ADDR PC-PORT
+              net.SocketAddress
+                  (net.IpAddress #[255, 255, 255, 255])
+                  PC-PORT
     if exception:
-      print "BCAST ERROR [$i]: $exception"
+      print "BCAST SEND ERROR [$i]: $exception"
     else:
       print "BCAST SENT [$i]: $payload"
     sleep --ms=500

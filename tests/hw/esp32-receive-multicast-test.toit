@@ -4,7 +4,7 @@ Also periodically sends multicast packets that Wireshark/tcpdump on the
 PC should be able to capture.
 
 Flash and run on ESP32:
-  jag run tests/esp32-receive-multicast-test.toit
+  jag run tests/hw/esp32-receive-multicast-test.toit
 
 Monitor output:
   jag monitor | tee /tmp/esp32-mcast.log

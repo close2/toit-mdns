@@ -4,3 +4,4 @@
 *.snapshot
 .idea
 .vscode
+tests/package.lock
