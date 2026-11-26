@@ -10,6 +10,7 @@ import net
 import net.modules.dns
 import ..net.mdns-socket
 import ..net.dns-helper as dns
+import ..net.ip-scope as ip-scope
 import ..net.names as names
 import .conflict-manager
 
@@ -45,6 +46,10 @@ class StateManager:
   static MAX-QU-MULTICAST-WINDOW-US_ ::= 4500 * 250_000
   /// Upper bound on queued deferred multicast records.
   static MAX-DEFERRED-RECORDS_ ::= 64
+  /// Maximum legacy/unicast replies per second to a single source IP.
+  static MAX-UNICAST-PER-SOURCE-PER-SEC_ ::= 4
+  /// Upper bound on tracked source IPs for unicast rate limiting.
+  static MAX-UNICAST-RATE-SOURCES_ ::= 16
 
   state_/int := STATE-PROBING
   socket_/MdnsSocket := ?
@@ -52,6 +57,7 @@ class StateManager:
   local-ip_/net.IpAddress := ?
   hostname_/string := ?
   expected-port_/int
+  local-prefix-length_/int?
 
   probe-count_/int := 0
   probe-timer_/Task? := null
@@ -66,6 +72,7 @@ class StateManager:
   deferred-multicast_/Map := {:}    // rate-key -> DeferredRecord_
   deferred-send-task_/Task? := null
   deferred-wakeup-us_/int := 0
+  unicast-source-rates_/Map := {:}  // source-ip -> [window-start-us, count]
 
   services_/List := []  // List<RegisteredService>
 
@@ -84,10 +91,13 @@ class StateManager:
   Creates a new $StateManager.
   The $hostname must end with `.local` (case-insensitive).
   */
-  constructor .socket_ .conflict-manager_ hostname/string .local-ip_ --expected-port/int=5353:
+  constructor .socket_ .conflict-manager_ hostname/string .local-ip_
+      --expected-port/int=5353
+      --local-prefix-length/int?=null:
     assert: names.validate-hostname hostname
     hostname_ = hostname
     expected-port_ = expected-port
+    local-prefix-length_ = local-prefix-length
     rebuild-host-records_
 
   rebuild-host-records_ -> none:
@@ -104,11 +114,20 @@ class StateManager:
   restarts probing per RFC 6762 §8.1.
   */
   update-network socket/MdnsSocket local-ip/net.IpAddress -> none:
+    had-announced := state_ == STATE-ANNOUNCING or state_ == STATE-ESTABLISHED
+    old-ip := local-ip_
     socket_ = socket
     local-ip_ = local-ip
     rebuild-host-records_
     cancel-deferred-multicast_
-    if not stopped_: enter-probing_
+    if not stopped_:
+      if had-announced and old-ip != local-ip and not socket_.is-closed:
+        send-raw_
+            --queries=[]
+            --records=[dns.AResource hostname_ 0 old-ip]
+            --is-response
+            --is-authoritative
+      enter-probing_
 
   /**
   Registers a DNS-SD service to be probed and announced.
@@ -203,6 +222,8 @@ class StateManager:
   */
   process-packet decoded/dns.DecodedPacket --source/net.SocketAddress?=null -> none:
     if stopped_: return
+    if source and not (ip-scope.is-local-source source.ip local-ip_ --prefix-length=local-prefix-length_):
+      return
     if not dns.is-valid-mdns-message decoded: return
 
     // RFC 6762 §6.10: Reject responses not from the expected mDNS port.
@@ -609,18 +630,19 @@ class StateManager:
           add-unique-record_ (use-unicast ? unicast-answers : multicast-answers) nsec
 
     if not unicast-answers.is-empty and source:
-      filtered-uni-add := unicast-additionals.filter: | r/dns.Resource |
-        not (unicast-answers.any (: dns.resource-equals it r))
-      id := query ? query.id : 0
-      questions := legacy-query and query ? query.questions : []
-      send-raw_
-          --queries=questions
-          --records=unicast-answers
-          --additionals=filtered-uni-add
-          --id=id
-          --is-response
-          --is-authoritative
-          --target=source
+      if allow-unicast-reply_ source now:
+        filtered-uni-add := unicast-additionals.filter: | r/dns.Resource |
+          not (unicast-answers.any (: dns.resource-equals it r))
+        id := query ? query.id : 0
+        questions := legacy-query and query ? query.questions : []
+        send-raw_
+            --queries=questions
+            --records=unicast-answers
+            --additionals=filtered-uni-add
+            --id=id
+            --is-response
+            --is-authoritative
+            --target=source
 
     if not multicast-answers.is-empty:
       filtered-mcast-add := multicast-additionals.filter: | r/dns.Resource |
@@ -635,6 +657,25 @@ class StateManager:
   add-unique-record_ list/List record/dns.Resource -> none:
     if list.any (: dns.resource-equals it record): return
     list.add record
+
+  allow-unicast-reply_ source/net.SocketAddress now/int -> bool:
+    key := source.ip.stringify
+    entry/List? := unicast-source-rates_.get key
+    if not entry or (now - (entry[0] as int)) >= 1_000_000:
+      if not entry and unicast-source-rates_.size >= MAX-UNICAST-RATE-SOURCES_:
+        oldest-k/string? := null
+        oldest-t := int.MAX
+        unicast-source-rates_.do: | k v/List |
+          if (v[0] as int) < oldest-t:
+            oldest-t = v[0] as int
+            oldest-k = k
+        if oldest-k: unicast-source-rates_.remove oldest-k
+      unicast-source-rates_[key] = [now, 1]
+      return true
+    count := entry[1] as int
+    if count >= MAX-UNICAST-PER-SOURCE-PER-SEC_: return false
+    entry[1] = count + 1
+    return true
 
   enqueue-or-send-multicast_ records/List now/int --additionals/List=[] --min-interval-us/int -> none:
     ready := []

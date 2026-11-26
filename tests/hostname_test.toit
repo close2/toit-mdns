@@ -34,7 +34,7 @@ test-hostname-api:
     // 3. Verify it responds to 'my-new-device.local'
     // We use a raw socket on the same port to query
     network := net.open
-    socket := MdnsSocket --network=network --port=port
+    socket := MdnsSocket --network=network --port=port --no-owns-network
     
     try:
       print "Querying my-new-device.local on port $port..."
@@ -64,7 +64,7 @@ test-hostname-api:
     sleep (Duration --s=2)
     
     // Quick verify
-    socket2 := MdnsSocket --network=network --port=port
+    socket2 := MdnsSocket --network=network --port=port --no-owns-network
     try:
       socket2.send (dns.create-dns-packet [dns.Question "already.local" dns.RECORD-A] [] --is-response=false --id=0x1234)
       found := false
@@ -77,6 +77,7 @@ test-hostname-api:
       print "Success: Received response for 'already.local'"
     finally:
       socket2.close
+      network.close
 
   finally:
     client.service_.close
