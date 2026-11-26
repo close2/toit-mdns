@@ -165,16 +165,24 @@ class Client:
     return service_.get-hostname
 
   /**
-  Registers a DNS-SD service to be probed and announced.
+  Registers a DNS-SD service to be probed and announced on this client's hostname.
   */
   register-service type/string port/int -> none
       --txt/Map?=null
-      --name/string?=null
-      --hostname/string?=null:
+      --name/string?=null:
     names.validate-service-type type
     if name: names.validate-instance-name name
     names.validate-txt txt
-    service_.register type port --txt=txt --name=name --hostname=hostname
+    service_.register type port --txt=txt --name=name
+
+  /**
+  Unregisters a previously registered DNS-SD service, sending goodbye packets
+  if already announced. Returns true if a matching service was removed.
+  */
+  unregister-service type/string --name/string?=null -> bool:
+    names.validate-service-type type
+    if name: names.validate-instance-name name
+    return service_.unregister type --name=name
 
   /**
   Closes this client connection and releases its hostname reference on the
@@ -237,9 +245,11 @@ class MdnsServiceClient extends ServiceClient implements MdnsService:
 
   register type/string port/int -> none
       --txt/Map?=null
-      --name/string?=null
-      --hostname/string?=null:
-    invoke_ MdnsService.REGISTER-INDEX [type, port, txt, name, hostname]
+      --name/string?=null:
+    invoke_ MdnsService.REGISTER-INDEX [type, port, txt, name]
+
+  unregister type/string --name/string?=null -> bool:
+    return invoke_ MdnsService.UNREGISTER-INDEX [type, name]
 
   set-hostname hostname/string -> none:
     invoke_ MdnsService.SET-HOSTNAME-INDEX hostname

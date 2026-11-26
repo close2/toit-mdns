@@ -25,9 +25,6 @@ import .support.capture
 
 /** Case names whose fix has not landed yet, with the phase that fixes them. */
 KNOWN-FAILING ::= {
-  "s4-cross-hostname-denied",            // P4.
-  "s4-no-hijack-on-shared-hostname",     // P4.
-  "f2-services-removed-on-close",        // P4.
   "f5-lookup-throws-dns-exception",      // P6.
 }
 
@@ -55,7 +52,9 @@ main:
   check "p2-low-alloc-packet-processing": test-process-packet-low-alloc it
   check "s4-cross-hostname-denied": test-cross-hostname-denied it
   check "s4-no-hijack-on-shared-hostname": test-no-hijack-on-shared-hostname it
+  check "s4-service-quota-and-rpc-validation": test-service-quota-and-rpc-validation it
   check "f2-services-removed-on-close": test-services-removed-on-close it
+  check "f2-unregister-service-sends-goodbye": test-unregister-service-sends-goodbye it
   check "f5-lookup-throws-dns-exception": test-lookup-throws-dns-exception it
 
   if not failures_.is-empty:
@@ -389,16 +388,60 @@ test-no-hijack-on-shared-hostname port/int:
       other.close
 
 test-services-removed-on-close port/int:
-  with-provider port: | provider/MdnsServiceProvider |
-    a := Client --hostname="shared-f2.local" --service=provider.connect-locally
-    b := Client --hostname="shared-f2.local" --service=provider.connect-locally
-    try:
-      a.register-service "_http._tcp" 80 --name="FromA"
-      a.close
-      manager/StateManager := provider.managers_["shared-f2.local"]
-      assert-equals_ 0 manager.services-count
-    finally:
-      b.close
+  capture := PacketCapture --port=port
+  provider := MdnsServiceProvider --port=port --local-ip=LOCAL-IP
+  a := Client --hostname="shared-f2.local" --service=provider.connect-locally
+  b := Client --hostname="shared-f2.local" --service=provider.connect-locally
+  try:
+    a.register-service "_http._tcp" 80 --name="FromA"
+    manager/StateManager := provider.managers_["shared-f2.local"]
+    wait-established manager
+    capture.clear
+    a.close
+    assert-equals_ 0 manager.services-count
+    goodbye := capture.wait-for --timeout=(Duration --ms=1000): | p/CapturedPacket |
+      p.is-response and p.all-records.any: | r/dns.Resource |
+        r.ttl == 0 and (dns-helper.name-equals r.name "FromA._http._tcp.local")
+    assert-not-null_ goodbye
+  finally:
+    a.close
+    b.close
+    provider.close
+    capture.close
+
+test-unregister-service-sends-goodbye port/int:
+  capture := PacketCapture --port=port
+  provider := MdnsServiceProvider --port=port --local-ip=LOCAL-IP
+  client := Client --hostname="unreg-f2.local" --service=provider.connect-locally
+  try:
+    client.register-service "_http._tcp" 8080 --name="TempSvc"
+    manager/StateManager := provider.managers_["unreg-f2.local"]
+    wait-established manager
+    capture.clear
+    assert-true_ (client.unregister-service "_http._tcp" --name="tempsvc")
+    assert-true_ (not (client.unregister-service "_http._tcp" --name="TempSvc"))
+    assert-equals_ 0 manager.services-count
+    goodbye := capture.wait-for --timeout=(Duration --ms=1000): | p/CapturedPacket |
+      p.is-response and p.all-records.any: | r/dns.Resource |
+        r.ttl == 0 and (dns-helper.name-equals r.name "TempSvc._http._tcp.local")
+    assert-not-null_ goodbye
+  finally:
+    client.close
+    provider.close
+    capture.close
+
+test-service-quota-and-rpc-validation port/int:
+  with-client port "quota-host.local": | client/Client provider/MdnsServiceProvider |
+    8.repeat: | i |
+      client.register-service "_http._tcp" (8000 + i) --name="svc-$i"
+    e := expect-throws:
+      client.register-service "_http._tcp" 8099 --name="svc-9th"
+    assert-true_ (e.to-string.contains "QUOTA_EXCEEDED") --message="unexpected $e"
+    // Verify RPC argument validation rejects bad types/sizes/ports.
+    expect-throws: provider.handle MdnsService.LOOKUP-INDEX "not-a-list" --client=1 --gid=0
+    expect-throws: provider.handle MdnsService.LOOKUP-INDEX ["a.local", "not-bool", false, 100] --client=1 --gid=0
+    expect-throws: provider.handle MdnsService.REGISTER-INDEX ["_http._tcp", 70000, null, "badport"] --client=1 --gid=0
+    expect-throws: provider.handle MdnsService.UNREGISTER-INDEX [123, null] --client=1 --gid=0
 
 // --- P6: client API. ---
 
