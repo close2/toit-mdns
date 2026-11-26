@@ -27,6 +27,9 @@ import .net.dns-helper as dns-helper
 import .net.names as names
 import .service as service
 
+/// Error text used when a hostname lookup yields no matching IP address.
+HOST-NOT-FOUND-ERROR ::= "No name record found"
+
 /**
 Primary user-facing mDNS client.
 
@@ -44,6 +47,7 @@ class Client:
   constructor
       --hostname/string=DEFAULT-HOSTNAME
       --service/MdnsService?=null:
+    owns-service := service == null
     if service:
       service_ = service
     else:
@@ -51,27 +55,40 @@ class Client:
       rpc-client.open
       service_ = rpc-client
 
-    set-hostname hostname
+    completed := false
+    try:
+      set-hostname hostname
+      completed = true
+    finally:
+      if not completed and owns-service:
+        catch: service_.close
 
   /** Returns a $dns.DnsClient adapter that delegates to this client. */
   dns-client -> dns.DnsClient:
     return DnsClient this
 
   /**
-  Resolves $name to a single $net.IpAddress, throwing `"HOST_NOT_FOUND"`
-  if no matching address record is found within $timeout.
+  Resolves $name to a single $net.IpAddress, throwing a $dns.DnsException
+  if no matching address record is found within $timeout or if $name is not
+  a `.local` or reverse-lookup name.
+
+  The $network parameter is accepted for $dns.DnsClient compatibility and
+  is ignored because the mDNS provider manages the multicast socket.
   */
   dns-lookup name/string -> net.IpAddress
       --network/udp.Interface?=null
       --accept-ipv4/bool=true
       --accept-ipv6/bool=false
       --timeout/Duration=dns.DNS-DEFAULT-TIMEOUT:
+    if not dns-helper.is-mdns-lookup-name name:
+      throw (dns.DnsException "Not a .local name" --name=name)
     results := service_.lookup name
         --accept-ipv4=accept-ipv4
         --accept-ipv6=accept-ipv6
         --timeout-us=timeout.in-us
 
-    if results.is-empty: throw "HOST_NOT_FOUND"
+    if results.is-empty:
+      throw (dns.DnsException HOST-NOT-FOUND-ERROR --name=name)
 
     results.do: | entry |
       // Support both [type, ip-bytes] pairs from QueryEngine and raw ByteArray entries.
@@ -81,11 +98,14 @@ class Client:
         if (not ip.is-ipv6 and accept-ipv4) or (ip.is-ipv6 and accept-ipv6):
           return ip
 
-    throw "HOST_NOT_FOUND"
+    throw (dns.DnsException HOST-NOT-FOUND-ERROR --name=name)
 
   /**
   Resolves specific DNS $record-types (a $List or $Set of `dns.RECORD-*`
   constants) for $name.
+
+  The $network parameter is accepted for $dns.DnsClient compatibility and
+  is ignored because the mDNS provider manages the multicast socket.
 
   Returns:
   - $net.IpAddress instances for `RECORD-A` / `RECORD-AAAA`
@@ -97,6 +117,8 @@ class Client:
       --record-types/Collection
       --network/udp.Interface?=null
       --timeout/Duration=dns.DNS-DEFAULT-TIMEOUT:
+    if not dns-helper.is-mdns-lookup-name name:
+      throw (dns.DnsException "Not a .local name" --name=name)
     mask := 0
     record-types.do: mask |= it
 
@@ -269,7 +291,16 @@ class LocalMdnsClient extends Client:
   provider_/service.MdnsServiceProvider
 
   constructor --hostname/string=Client.DEFAULT-HOSTNAME:
-    provider_ = service.MdnsServiceProvider
+    provider := service.MdnsServiceProvider
+    completed := false
+    try:
+      instance := LocalMdnsClient.internal_ provider --hostname=hostname
+      completed = true
+      return instance
+    finally:
+      if not completed: catch: provider.close
+
+  constructor.internal_ .provider_ --hostname/string:
     super --hostname=hostname --service=provider_.connect-locally
 
   close -> none:

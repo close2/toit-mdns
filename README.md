@@ -125,4 +125,4 @@ client := Client
 dns.default-mdns-client = client.dns-client
 ```
 
-The background `MdnsServiceProvider` continuously listens to the multicast group. It maintains a cache of the network state, meaning lookups can often be answered instantly without waiting for a network query.
+The background `MdnsServiceProvider` listens continuously for queries and conflict announcements for registered names, and caches records learned during active lookups (along with their DNS-SD additionals) within a bounded memory budget so repeated queries are often answered immediately without waiting on the network.

@@ -32,9 +32,11 @@ test-goodbye-keeps-record-briefly:
   goodbye := dns.AResource "alpha.local" 0 (net.IpAddress.parse "10.0.0.1")
   cache.add goodbye
 
-  // Immediately after add the record must still be visible: RFC 6762
-  // §10.1 says listeners get one second of grace.
-  results := cache.lookup "alpha.local" dns.RECORD-A
+  // Immediately after add, normal lookup skips the goodbye record, while
+  // --include-goodbye shows it is still retained during the 1s grace window
+  // per RFC 6762 §10.1.
+  expect (cache.lookup "alpha.local" dns.RECORD-A).is-empty
+  results := cache.lookup "alpha.local" dns.RECORD-A --include-goodbye
   expect-equals 1 results.size
   print "  PASS"
 

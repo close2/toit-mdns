@@ -18,8 +18,9 @@ class CacheEntry:
   received-us/int
   expiry/int  // Monotonic microsecond timestamp.
   size/int
+  goodbye/bool
 
-  constructor .record .received-us .expiry .size:
+  constructor .record .received-us .expiry .size --.goodbye/bool=false:
 
 /**
 Bounded mDNS response cache indexed by `(name, type, class)`.
@@ -63,7 +64,8 @@ class MdnsCache:
     list := records_.get key --init=(: [])
 
     now := Time.monotonic-us
-    effective-ttl := record.ttl > 0 ? (min record.ttl MAX-TTL-S_) : 1
+    is-goodbye := record.ttl == 0
+    effective-ttl := is-goodbye ? 1 : (min record.ttl MAX-TTL-S_)
     expiry := now + (effective-ttl * 1_000_000)
 
     if record.flush:
@@ -77,26 +79,26 @@ class MdnsCache:
       entry/CacheEntry := list[i]
       if dns-helper.resource-equals entry.record record:
         bytes_ += entry-size - entry.size
-        list[i] = CacheEntry record now expiry entry-size
+        list[i] = CacheEntry record now expiry entry-size --goodbye=is-goodbye
         if bytes_ > max-bytes_: evict-to-budget_ (max-bytes_ * 3 / 4)
         return
 
     if list.size >= MAX-ENTRIES-PER-KEY_:
       evict-oldest-in-list_ list
-    list.add (CacheEntry record now expiry entry-size)
+    list.add (CacheEntry record now expiry entry-size --goodbye=is-goodbye)
     bytes_ += entry-size
     if records_.size > MAX-KEYS_: evict-one_
     if bytes_ > max-bytes_: evict-to-budget_ (max-bytes_ * 3 / 4)
 
   /** Returns unexpired $dns.Resource records for $name and $type. */
-  lookup name/string type/int -> List:
+  lookup name/string type/int --include-goodbye/bool=false -> List:
     cleanup_
     key := build-key_ name type dns.CLASS-INTERNET
     list := records_.get key --if-absent=(: return [])
     now := Time.monotonic-us
     result := []
     list.do: | entry/CacheEntry |
-      if entry.expiry > now:
+      if entry.expiry > now and (include-goodbye or not entry.goodbye):
         result.add entry.record
     return result
 
