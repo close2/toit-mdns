@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 import expect show *
-import mdns.server.conflict_manager show ConflictManager
+import mdns.private.conflict_manager show ConflictManager
 
 main:
   test-next-name-with-local-suffix

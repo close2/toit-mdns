@@ -12,14 +12,14 @@ import net.modules.dns
 import system.services
 
 import .api.mdns-service
-import .net.dns-helper as dns
-import .net.ip-scope as ip-scope
-import .net.mdns-socket
-import .net.names as names
-import .server.cache
-import .server.conflict-manager
-import .server.query-engine
-import .server.state-manager
+import .private.dns-helper as dns
+import .private.ip-scope as ip-scope
+import .private.mdns-socket
+import .private.names as names
+import .private.cache
+import .private.conflict-manager
+import .private.query-engine
+import .private.state-manager
 
 class RegisteredEntry_:
   service-key/string
@@ -169,7 +169,7 @@ class MdnsServiceProvider extends services.ServiceProvider
 
     manager/StateManager? := managers_.get committed-key
     if not manager:
-      throw "Hostname '$committed-key' not active (call set-hostname first)"
+      throw "HOSTNAME_NOT_ACTIVE: '$committed-key' (call set-hostname first)"
 
     is-default := name == null
     effective-name := name or (manager.hostname[..manager.hostname.size - 6])
@@ -253,9 +253,9 @@ class MdnsServiceProvider extends services.ServiceProvider
 
   client-get-hostname_ client/int -> string:
     committed-key := client-commitments_.get client
-    if not committed-key: throw "Client has not set a hostname"
+    if not committed-key: throw "CLIENT_NO_HOSTNAME"
     manager/StateManager? := managers_.get committed-key
-    if not manager: throw "Manager not found for $committed-key"
+    if not manager: throw "MANAGER_NOT_FOUND: $committed-key"
     return manager.hostname
 
   /**
@@ -419,7 +419,7 @@ class MdnsServiceProvider extends services.ServiceProvider
         packet-bytes := datagram.data
         // Zero-allocation header & port check before constructing DecodedPacket:
         // - RFC 6762 §18.3 / §18.11: Ignore non-zero OPCODE or RCODE.
-        // - RFC 6762 §6.10: Ignore responses not originating from port 5353.
+        // - RFC 6762 §6 (source port): Ignore responses not originating from port 5353.
         if not dns.is-valid-raw-mdns-header packet-bytes: continue
         is-response := (packet-bytes[2] & 0x80) != 0
         if is-response:
@@ -447,7 +447,7 @@ class MdnsServiceProvider extends services.ServiceProvider
             log.warn "mDNS manager processing error"
                 --tags={"error": manager-exception, "hostname": manager.hostname}
 
-        // RFC 6762 §7.3 & §6.10: Only cache/resolve from validated port-5353 responses.
+        // RFC 6762 §7.3 & §6 (source port): Only cache/resolve from validated port-5353 responses.
         if decoded.is-response and datagram.address.port == port:
           query-exception := catch:
             query-engine_.process-packet decoded
@@ -509,9 +509,6 @@ class MdnsServiceProvider extends services.ServiceProvider
     if accept-ipv4: mask |= dns.RECORD-A
     if accept-ipv6: mask |= dns.RECORD-AAAA
     results := query-engine_.lookup name --record-types=mask --timeout-us=timeout-us
-    // Standard IP lookup RPC (LOOKUP-INDEX) is consumed both by Client.dns-lookup
-    // (which accepts raw IP ByteArrays or [type, ip-bytes] pairs) and direct callers
-    // like tests/client_test.toit (which expects [type, ip-bytes] pairs).
     return results
 
   lookup name/string -> List
@@ -523,10 +520,11 @@ class MdnsServiceProvider extends services.ServiceProvider
     return query-engine_.lookup name --record-types=record-types --timeout-us=timeout-us
 
   /**
-  Returns the hostname of the first active manager (primarily for diagnostics).
+  Returns the hostname of the first active manager (primarily for diagnostics),
+  or null when no hostname is active.
   */
-  hostname -> string:
-    if managers_.is-empty: return "no-active-check"
+  hostname -> string?:
+    if managers_.is-empty: return null
     return managers_.values.first.hostname
 
   connect-locally -> MdnsService:

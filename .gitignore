@@ -5,3 +5,8 @@
 .idea
 .vscode
 tests/package.lock
+examples/package.lock
+examples/.packages/
+package.lock
+jaguar
+mdns-test.toit
