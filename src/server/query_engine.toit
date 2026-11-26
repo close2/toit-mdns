@@ -12,6 +12,7 @@ mDNS responses:
   multicast queries within 1 second.
 */
 
+import log
 import monitor show Latch
 import net.modules.dns
 import ..net.dns-helper as dns-helper
@@ -166,11 +167,20 @@ class QueryEngine:
     if questions.is-empty: return
 
     last-query-sent_[key] = now
-    catch:
-      packet := dns-helper.encode-mdns-packet questions known-answers
+    packets/List? := null
+    encode-err := catch:
+      packets = dns-helper.encode-mdns-packets questions known-answers
           --id=0
           --no-is-response
-      socket_.send packet
+          --max-size=socket_.max-payload-size
+    if encode-err or not packets:
+      log.error "mDNS query encode failed" --tags={"error": encode-err, "name": name}
+      return
+    packets.do: | packet/ByteArray |
+      send-err := catch:
+        socket_.send packet
+      if send-err:
+        log.debug "mDNS query send skipped" --tags={"error": send-err}
 
   prune-query-timestamps_ -> none:
     if last-query-sent_.size <= 32: return

@@ -14,6 +14,7 @@ import system.services
 import .api.mdns-service
 import .net.dns-helper as dns
 import .net.mdns-socket
+import .net.names as names
 import .server.cache
 import .server.conflict-manager
 import .server.query-engine
@@ -87,6 +88,9 @@ class MdnsServiceProvider extends services.ServiceProvider
       --txt/Map?=null
       --name/string?=null
       --hostname/string?=null:
+    names.validate-service-type type
+    if name: names.validate-instance-name name
+    names.validate-txt txt
     ensure-socket_
     if not hostname: throw "No hostname specified for registration"
     key := hostname.to-ascii-lower
@@ -96,8 +100,7 @@ class MdnsServiceProvider extends services.ServiceProvider
     manager.register-service type port --txt=txt --name=name
 
   client-set-hostname_ client/int name/string -> none:
-    if not dns.has-local-suffix name:
-      throw "Invalid hostname: $name"
+    names.validate-hostname name
     ensure-socket_
     key := name.to-ascii-lower
 

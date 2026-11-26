@@ -17,7 +17,7 @@ test-connect-locally:
   expect-equals "local-test.local" client.hostname
   
   // Register service
-  client.register-service "_local_test._tcp" 1234 --txt={"foo": "bar"}
+  client.register-service "_local-test._tcp" 1234 --txt={"foo": "bar"}
   
   // Clean up
   client.close

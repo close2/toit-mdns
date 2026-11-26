@@ -8,6 +8,7 @@ numeric suffix (`"name"` -> `"name-2"` -> `"name-3"`), preserving any
 
 import log
 import ..net.dns-helper as dns-helper
+import ..net.names as names
 
 /// Maximum octets in a single DNS label per RFC 1035 §2.3.4.
 MAX-DNS-LABEL-OCTETS_ ::= 63
@@ -51,4 +52,6 @@ class ConflictManager:
     if base-name.size > max-base-len:
       base-name = dns-helper.truncate-utf8 base-name max-base-len
 
-    return "$base-name$num-suffix$suffix"
+    result := "$base-name$num-suffix$suffix"
+    assert: suffix.is-empty ? (names.validate-instance-name result) : (names.validate-hostname result)
+    return result
