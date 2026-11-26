@@ -2,8 +2,8 @@
 ESP32 device A: Registers an mDNS service and tries to discover device B.
 
 Run on ESP32 #1:
-  build/jag run --device 10.0.100.181 \
-      third_party/toit.worktree1/toit-mdns.v4/tests/esp32-mdns-device-a.toit
+  jag run --device 10.0.100.181 \
+      tests/hw/esp32-mdns-device-a.toit
 */
 import mdns.client show LocalMdnsClient
 

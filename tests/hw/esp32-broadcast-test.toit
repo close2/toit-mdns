@@ -3,7 +3,7 @@ Test both broadcast AND unicast-to-multicast-port between ESP32s.
 This helps narrow down whether the issue is multicast-MAC-specific.
 
 Run on both ESP32s:
-  jag run --device <IP> tests/esp32-broadcast-test.toit
+  jag run --device <IP> tests/hw/esp32-broadcast-test.toit
 */
 import net
 import net.udp

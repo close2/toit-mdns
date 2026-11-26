@@ -1,8 +1,6 @@
 file(GLOB TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "*-test.toit" "*_test.toit")
 
-# Exclude hardware-specific tests that require ESP32 or a specific network setup.
-list(FILTER TESTS EXCLUDE REGEX "^esp32-")
-list(FILTER TESTS EXCLUDE REGEX "^pc-")
+# Hardware tests live in tests/hw/ and are not part of the CTest suite.
 
 find_program(TOIT_EXEC toit)
 

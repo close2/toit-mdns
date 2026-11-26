@@ -4,7 +4,7 @@ Sends multicast packets with device identity and prints any received.
 Run on both ESP32s to test if they can hear each other.
 
 Usage:
-  jag run --device <IP> tests/esp32-mcast-ping.toit
+  jag run --device <IP> tests/hw/esp32-mcast-ping.toit
 */
 import net
 import net.udp
