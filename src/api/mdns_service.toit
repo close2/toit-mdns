@@ -21,7 +21,7 @@ interface MdnsService:
   static SELECTOR ::= ServiceSelector
       --uuid="3d63eed1-785e-43e4-878f-204e4cd390ff"  // Random UUID
       --major=0
-      --minor=1
+      --minor=2
 
   /// Standard lookup matching dns.dns-lookup arguments.
   lookup name/string -> any
@@ -37,18 +37,23 @@ interface MdnsService:
   static LOOKUP-DETAILED-INDEX ::= 101
 
   /**
-  Registers a service.
+  Registers a service on this client's committed hostname.
   $type: The service type, e.g. "_http._tcp".
   $port: The port the service is running on.
   $txt: A map of TXT record key-values.
   $name: Optional instance name. If null, uses the device hostname (without .local).
-  $hostname: Optional hostname to attach the service to. If null, uses the primary hostname.
   */
   register type/string port/int -> none
       --txt/Map?=null
       --name/string?=null
-      --hostname/string?=null
   static REGISTER-INDEX ::= 200
+
+  /**
+  Unregisters a previously registered service owned by this client.
+  Returns true if a matching service was removed, or false otherwise.
+  */
+  unregister type/string --name/string?=null -> bool
+  static UNREGISTER-INDEX ::= 201
 
   /**
   Sets the hostname for this client context.

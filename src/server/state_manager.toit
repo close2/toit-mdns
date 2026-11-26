@@ -143,10 +143,11 @@ class StateManager:
   */
   unregister-service type/string --name/string?=null -> bool:
     target-name := name or (hostname_.copy 0 hostname_.size - 6)
-    for i := 0; i < services_.size; i++:
+    services_.size.repeat: | i |
       s/RegisteredService := services_[i]
       if (dns.name-equals s.type type) and
-          (s.original-instance-name == target-name or s.instance-name == target-name):
+          ((dns.name-equals s.original-instance-name target-name) or
+              (dns.name-equals s.instance-name target-name)):
         services_.remove --at=i
         if not stopped_ and (state_ == STATE-ANNOUNCING or state_ == STATE-ESTABLISHED):
           send-service-goodbye_ s

@@ -20,6 +20,14 @@ import .server.conflict-manager
 import .server.query-engine
 import .server.state-manager
 
+class RegisteredEntry_:
+  service-key/string
+  type/string
+  instance-name/string
+  is-default/bool
+
+  constructor .service-key .type .instance-name .is-default:
+
 /**
 mDNS system service provider.
 
@@ -30,9 +38,17 @@ underlying network interface resets while active clients are attached.
 */
 class MdnsServiceProvider extends services.ServiceProvider
     implements services.ServiceHandler:
-  managers_/Map := {:}            // lowercased hostname -> StateManager
-  manager-refs_/Map := {:}        // lowercased hostname -> int
-  client-commitments_/Map := {:}  // client-id -> lowercased hostname
+  static MAX-SERVICES-PER-CLIENT_ ::= 8
+  static MAX-SERVICES-PER-HOSTNAME_ ::= 16
+  static MAX-PENDING-PER-CLIENT_ ::= 4
+  static MAX-LOOKUP-TIMEOUT-US_ ::= 60_000_000
+
+  managers_/Map := {:}                // lowercased hostname -> StateManager
+  manager-refs_/Map := {:}            // lowercased hostname -> int
+  client-commitments_/Map := {:}      // client-id -> lowercased hostname
+  client-services_/Map := {:}         // client-id -> Map<service-key, RegisteredEntry_>
+  service-owners_/Map := {:}          // service-key -> client-id
+  client-pending-lookups_/Map := {:}  // client-id -> int
 
   socket_/MdnsSocket? := null
   cache_/MdnsCache? := null
@@ -66,40 +82,156 @@ class MdnsServiceProvider extends services.ServiceProvider
       --gid/int
       --client/int:
     if index == MdnsService.LOOKUP-INDEX:
+      if arguments is not List: throw "INVALID_ARGUMENT"
       args := arguments as List
-      return lookup args[0] --accept-ipv4=args[1] --accept-ipv6=args[2] --timeout-us=args[3]
+      if args.size != 4 or args[0] is not string or args[1] is not bool or
+          args[2] is not bool or args[3] is not int:
+        throw "INVALID_ARGUMENT"
+      timeout := min (max 0 (args[3] as int)) MAX-LOOKUP-TIMEOUT-US_
+      return with-client-lookup_ client:
+        lookup (args[0] as string)
+            --accept-ipv4=(args[1] as bool)
+            --accept-ipv6=(args[2] as bool)
+            --timeout-us=timeout
     if index == MdnsService.LOOKUP-DETAILED-INDEX:
+      if arguments is not List: throw "INVALID_ARGUMENT"
       args := arguments as List
-      return lookup args[0] --record-types=args[1] --timeout-us=args[2]
+      if args.size != 3 or args[0] is not string or args[1] is not int or args[2] is not int:
+        throw "INVALID_ARGUMENT"
+      timeout := min (max 0 (args[2] as int)) MAX-LOOKUP-TIMEOUT-US_
+      return with-client-lookup_ client:
+        lookup (args[0] as string)
+            --record-types=(args[1] as int)
+            --timeout-us=timeout
     if index == MdnsService.REGISTER-INDEX:
+      if arguments is not List: throw "INVALID_ARGUMENT"
       args := arguments as List
-      type := args[0] as string
-      port_ := args[1] as int
-      txt := args[2]
-      instance-name := args[3]
-      target := args.size > 4 ? args[4] : null
-      if not target: target = client-commitments_.get client
-      return register type port_ --txt=txt --name=instance-name --hostname=target
+      if args.size < 4 or args.size > 5: throw "INVALID_ARGUMENT"
+      if args[0] is not string or args[1] is not int: throw "INVALID_ARGUMENT"
+      if args[2] != null and args[2] is not Map: throw "INVALID_ARGUMENT"
+      if args[3] != null and args[3] is not string: throw "INVALID_ARGUMENT"
+      if args.size == 5 and args[4] != null and args[4] is not string:
+        throw "INVALID_ARGUMENT"
+      target := (args.size == 5 and args[4] != null) ? (args[4] as string) : null
+      txt := args[2] != null ? (args[2] as Map) : null
+      instance-name := args[3] != null ? (args[3] as string) : null
+      return client-register_ client (args[0] as string) (args[1] as int)
+          --txt=txt
+          --name=instance-name
+          --target-hostname=target
+    if index == MdnsService.UNREGISTER-INDEX:
+      if arguments is not List: throw "INVALID_ARGUMENT"
+      args := arguments as List
+      if args.size != 2 or args[0] is not string or (args[1] != null and args[1] is not string):
+        throw "INVALID_ARGUMENT"
+      instance-name := args[1] != null ? (args[1] as string) : null
+      return client-unregister_ client (args[0] as string) --name=instance-name
     if index == MdnsService.SET-HOSTNAME-INDEX:
+      if arguments is not string: throw "INVALID_ARGUMENT"
       return client-set-hostname_ client (arguments as string)
     if index == MdnsService.GET-HOSTNAME-INDEX:
       return client-get-hostname_ client
     unreachable
 
-  register type/string port/int -> none
+  with-client-lookup_ client/int [block] -> any:
+    count := client-pending-lookups_.get client --init=(: 0)
+    if count >= MAX-PENDING-PER-CLIENT_:
+      throw "QUOTA_EXCEEDED: too many concurrent lookups"
+    client-pending-lookups_[client] = count + 1
+    try:
+      return block.call
+    finally:
+      cur := client-pending-lookups_.get client
+      if cur:
+        if cur <= 1: client-pending-lookups_.remove client
+        else: client-pending-lookups_[client] = cur - 1
+
+  client-register_ client/int type/string svc-port/int -> none
       --txt/Map?=null
       --name/string?=null
-      --hostname/string?=null:
+      --target-hostname/string?=null:
+    if svc-port < 0 or svc-port > 65535:
+      throw "INVALID_ARGUMENT: port out of range"
     names.validate-service-type type
     if name: names.validate-instance-name name
     names.validate-txt txt
     ensure-socket_
-    if not hostname: throw "No hostname specified for registration"
-    key := hostname.to-ascii-lower
-    manager/StateManager? := managers_.get key
+
+    committed-key := client-commitments_.get client
+    if not committed-key:
+      throw "PERMISSION_DENIED: client has not set a hostname"
+    if target-hostname != null and target-hostname.to-ascii-lower != committed-key:
+      throw "PERMISSION_DENIED: cannot register service on another hostname"
+
+    manager/StateManager? := managers_.get committed-key
     if not manager:
-      throw "Hostname '$hostname' not active (call set-hostname first)"
-    manager.register-service type port --txt=txt --name=name
+      throw "Hostname '$committed-key' not active (call set-hostname first)"
+
+    is-default := name == null
+    effective-name := name or (manager.hostname[..manager.hostname.size - 6])
+    service-key := "$(committed-key)|$(type.to-ascii-lower)|$(effective-name.to-ascii-lower)"
+
+    existing-owner := service-owners_.get service-key
+    if existing-owner != null and existing-owner != client:
+      throw "PERMISSION_DENIED: service is owned by another client"
+
+    owned := client-services_.get client
+    if existing-owner == null:
+      if owned and owned.size >= MAX-SERVICES-PER-CLIENT_:
+        throw "QUOTA_EXCEEDED: too many services for client"
+      if manager.services-count >= MAX-SERVICES-PER-HOSTNAME_:
+        throw "QUOTA_EXCEEDED: too many services for hostname"
+
+    manager.register-service type svc-port --txt=txt --name=effective-name
+    entry := RegisteredEntry_ service-key type effective-name is-default
+    if not owned:
+      owned = {:}
+      client-services_[client] = owned
+    owned[service-key] = entry
+    service-owners_[service-key] = client
+
+  client-unregister_ client/int type/string --name/string?=null -> bool:
+    names.validate-service-type type
+    if name: names.validate-instance-name name
+    owned/Map? := client-services_.get client
+    if not owned or owned.is-empty: return false
+    committed-key := client-commitments_.get client
+    if not committed-key: return false
+    manager/StateManager? := managers_.get committed-key
+    if not manager: return false
+
+    entry/RegisteredEntry_? := null
+    if name:
+      key := "$(committed-key)|$(type.to-ascii-lower)|$(name.to-ascii-lower)"
+      entry = owned.get key
+    else:
+      current-default := manager.hostname[..manager.hostname.size - 6]
+      key := "$(committed-key)|$(type.to-ascii-lower)|$(current-default.to-ascii-lower)"
+      entry = owned.get key
+      if not entry:
+        type-lower := type.to-ascii-lower
+        owned.do: | _ candidate/RegisteredEntry_ |
+          if candidate.is-default and candidate.type.to-ascii-lower == type-lower:
+            entry = candidate
+    if not entry: return false
+    if (service-owners_.get entry.service-key) != client: return false
+
+    owned.remove entry.service-key
+    if owned.is-empty: client-services_.remove client
+    service-owners_.remove entry.service-key
+    return manager.unregister-service entry.type --name=entry.instance-name
+
+  unregister-client-services_ client/int -> none:
+    owned/Map? := client-services_.get client
+    if not owned: return
+    client-services_.remove client
+    committed-key := client-commitments_.get client
+    manager/StateManager? := committed-key ? (managers_.get committed-key) : null
+    owned.do: | _ entry/RegisteredEntry_ |
+      if (service-owners_.get entry.service-key) == client:
+        service-owners_.remove entry.service-key
+      if manager:
+        manager.unregister-service entry.type --name=entry.instance-name
 
   client-set-hostname_ client/int name/string -> none:
     names.validate-hostname name
@@ -109,6 +241,7 @@ class MdnsServiceProvider extends services.ServiceProvider
     old-key := client-commitments_.get client
     if old-key == key: return
     if old-key:
+      unregister-client-services_ client
       decrement-ref_ old-key
 
     client-commitments_[client] = key
@@ -156,6 +289,8 @@ class MdnsServiceProvider extends services.ServiceProvider
       manager-refs_[key] = new-count
 
   cleanup-client_ client/int -> none:
+    client-pending-lookups_.remove client
+    unregister-client-services_ client
     key := client-commitments_.get client
     if key:
       client-commitments_.remove client
@@ -340,11 +475,11 @@ class DirectMdnsService_ implements MdnsService:
 
   register type/string port/int -> none
       --txt/Map?=null
-      --name/string?=null
-      --hostname/string?=null:
-    target := hostname
-    if not target: target = provider_.client-commitments_.get client-id_
-    provider_.register type port --txt=txt --name=name --hostname=target
+      --name/string?=null:
+    provider_.client-register_ client-id_ type port --txt=txt --name=name
+
+  unregister type/string --name/string?=null -> bool:
+    return provider_.client-unregister_ client-id_ type --name=name
 
   get-hostname -> string:
     return provider_.client-get-hostname_ client-id_

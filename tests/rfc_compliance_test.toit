@@ -415,7 +415,7 @@ test-e2e-rfc-compliance:
 
   service := MdnsServiceProvider --port=TEST-PORT
   service.handle MdnsService.SET-HOSTNAME-INDEX "rfc-test.local" --client=0 --gid=0
-  service.register "_rfc._tcp" 9999 --name="RFCInstance" --hostname="rfc-test.local"
+  service.handle MdnsService.REGISTER-INDEX ["_rfc._tcp", 9999, null, "RFCInstance"] --client=0 --gid=0
 
   network := net.open
   monitor := MdnsSocket --network=network --port=TEST-PORT
