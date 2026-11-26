@@ -39,19 +39,58 @@ HARD-MAX-MDNS-PACKET-SIZE_ ::= 9000
 /**
 Restricted-form mDNS NSEC resource record (RFC 6762 §6.1).
 
-Asserts which record $types (in Window Block 0, `0..255`) exist for $name
+Asserts which record types (in Window Block 0, `0..255`) exist for $name
 and that no other record types exist for that unique domain name.
 */
 class NsecResource extends dns.Resource:
   next-domain/string
-  types/List  // List<int> of present RR type codes in 0..255.
+  bitmap/ByteArray
 
-  constructor name/string ttl/int flush/bool .next-domain .types:
+  constructor name/string ttl/int flush/bool .next-domain types/List:
+    bitmap = build-bitmap_ types
+    super name RECORD-NSEC ttl flush
+
+  constructor.from-bitmap name/string ttl/int flush/bool .next-domain raw-bitmap/ByteArray:
+    bitmap = normalize-bitmap_ raw-bitmap
     super name RECORD-NSEC ttl flush
 
   /** Returns true if $rr-type is marked present in the NSEC bitmap. */
   has-type rr-type/int -> bool:
-    return types.contains rr-type
+    if rr-type < 0 or rr-type >= 256: return false
+    byte-idx := rr-type >> 3
+    if byte-idx >= bitmap.size: return false
+    return (bitmap[byte-idx] & (0x80 >> (rr-type & 7))) != 0
+
+  /** Returns the list of RR type codes marked present in Window Block 0. */
+  types -> List:
+    out := []
+    bitmap.size.repeat: | byte-idx |
+      b := bitmap[byte-idx]
+      if b != 0:
+        8.repeat: | bit |
+          if (b & (0x80 >> bit)) != 0:
+            out.add ((byte-idx << 3) | bit)
+    return out
+
+  static build-bitmap_ types/List -> ByteArray:
+    max-type := 0
+    types.do: | t/int |
+      if 0 <= t < 256 and t > max-type: max-type = t
+    bm-len := (max-type >> 3) + 1
+    out := ByteArray bm-len
+    types.do: | t/int |
+      if 0 <= t < 256:
+        out[t >> 3] |= 0x80 >> (t & 7)
+    return normalize-bitmap_ out
+
+  static normalize-bitmap_ raw/ByteArray -> ByteArray:
+    limit := min raw.size 32
+    last-nz := -1
+    limit.repeat: | i |
+      if raw[i] != 0: last-nz = i
+    if last-nz < 0: return #[0]
+    if last-nz + 1 == raw.size: return raw
+    return raw[..last-nz + 1]
 
 /**
 Fast zero-allocation check on a raw UDP payload before full parsing.
@@ -183,24 +222,25 @@ decode-resource_ reader/io.Reader packet/ByteArray name-cache/Map -> dns.Resourc
     value := decode-name_ reader packet name-cache
     result = dns.SrvResource r-name type ttl flush value priority weight port
   else if type == RECORD-NSEC:
+    if rd-length > MAX-MDNS-PACKET-SIZE: throw "CORRUPT_NSEC_RECORD"
     next-domain := decode-name_ reader packet name-cache
-    types := []
+    prev-window := -1
+    bitmap := #[0]
     while (reader.processed - read-before) < rd-length:
       if (rd-length - (reader.processed - read-before)) < 2:
         throw "CORRUPT_NSEC_RECORD"
       window := reader.read-byte
       bm-len := reader.read-byte
       if bm-len < 1 or bm-len > 32: throw "CORRUPT_NSEC_RECORD"
+      if window <= prev-window: throw "CORRUPT_NSEC_RECORD"
+      prev-window = window
       if (reader.processed - read-before) + bm-len > rd-length:
         throw "CORRUPT_NSEC_RECORD"
-      bm := reader.read-bytes bm-len
-      bm-len.repeat: | byte-idx |
-        b := bm[byte-idx]
-        if b != 0:
-          8.repeat: | bit |
-            if (b & (0x80 >> bit)) != 0:
-              types.add ((window << 8) | (byte-idx << 3) | bit)
-    result = NsecResource r-name ttl flush next-domain types
+      if window == 0:
+        bitmap = reader.read-bytes bm-len
+      else:
+        reader.skip bm-len
+    result = NsecResource.from-bitmap r-name ttl flush next-domain bitmap
 
   read-after := reader.processed
   to-skip := rd-length - (read-after - read-before)
@@ -487,24 +527,19 @@ write-resource_ record/dns.Resource --locations/Map? --buffer/io.Buffer -> none:
     nsec := record as NsecResource
     // Write uncompressed next-domain (valid in both multicast mDNS and legacy unicast).
     name-length := write-name_ nsec.next-domain --locations=null --buffer=null
-    bitmap := encode-nsec-bitmap_ nsec.types
-    be.write-int16 (name-length + bitmap.size)
+    bm := encode-nsec-bitmap_ nsec.bitmap
+    be.write-int16 (name-length + bm.size)
     write-name_ nsec.next-domain --locations=null --buffer=buffer
-    buffer.write bitmap
+    buffer.write bm
   else:
     throw "Unsupported DNS resource type: $type"
 
-encode-nsec-bitmap_ types/List -> ByteArray:
-  max-type := 0
-  types.do: | t/int |
-    if 0 <= t < 256 and t > max-type: max-type = t
-  bm-len := (max-type >> 3) + 1
+encode-nsec-bitmap_ bitmap/ByteArray -> ByteArray:
+  bm-len := bitmap.size
   out := ByteArray (2 + bm-len)
   out[0] = 0  // Window Block 0.
   out[1] = bm-len
-  types.do: | t/int |
-    if 0 <= t < 256:
-      out[2 + (t >> 3)] |= 0x80 >> (t & 7)
+  out.replace 2 bitmap
   return out
 
 write-name_ name/string --locations/Map? --buffer/io.Buffer? -> int:
@@ -569,12 +604,26 @@ truncate-utf8 s/string max-bytes/int -> string:
   return s[..end]
 
 /**
+Returns true if $name ends with $suffix (matched ASCII case-insensitively)
+with a non-empty prefix, without allocating.
+*/
+name-ends-with_ name/string suffix/string -> bool:
+  if name.size <= suffix.size: return false
+  offset := name.size - suffix.size
+  suffix.size.repeat: | i |
+    ca := name.at --raw (offset + i)
+    cb := suffix.at --raw i
+    if 'A' <= ca <= 'Z': ca += 'a' - 'A'
+    if 'A' <= cb <= 'Z': cb += 'a' - 'A'
+    if ca != cb: return false
+  return true
+
+/**
 Returns true if $name has a non-empty prefix followed by `.local`
 (matched case-insensitively per RFC 6762 §16).
 */
 has-local-suffix name/string -> bool:
-  if name.size <= 6: return false
-  return name-equals name[name.size - 6..] ".local"
+  return name-ends-with_ name ".local"
 
 /**
 Validates that a decoded packet conforms to mDNS header requirements
@@ -630,8 +679,7 @@ resource-rdata-matches_ actual/dns.Resource expected/dns.Resource -> bool:
     na := actual as NsecResource
     nb := expected as NsecResource
     if not name-equals na.next-domain nb.next-domain: return false
-    if na.types.size != nb.types.size: return false
-    return na.types.every: nb.types.contains it
+    return na.bitmap == nb.bitmap
   return false
 
 /**
@@ -762,7 +810,7 @@ canonical-tiebreak-entry_ res/dns.Resource -> List:
   else if res is NsecResource:
     nsec := res as NsecResource
     write-name_ nsec.next-domain.to-ascii-lower --locations=null --buffer=buf
-    buf.write (encode-nsec-bitmap_ nsec.types)
+    buf.write (encode-nsec-bitmap_ nsec.bitmap)
   return [dns.CLASS-INTERNET, res.type, buf.bytes]
 
 compare-tiebreak-entry_ a/List b/List -> int:

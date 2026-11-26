@@ -17,8 +17,9 @@ class CacheEntry:
   record/dns.Resource
   received-us/int
   expiry/int  // Monotonic microsecond timestamp.
+  size/int
 
-  constructor .record .received-us .expiry:
+  constructor .record .received-us .expiry .size:
 
 /**
 Bounded mDNS response cache indexed by `(name, type, class)`.
@@ -29,9 +30,21 @@ class MdnsCache:
 
   static CLEANUP-INTERVAL-US_ ::= 1_000_000
   static MAX-KEYS_ ::= 64
-  static MAX-ENTRIES-PER-KEY_ ::= 32
-  static MAX-TTL-S_ ::= 86_400
+  static MAX-ENTRIES-PER-KEY_ ::= 16
+  static MAX-TTL-S_ ::= 4500
+  static ENTRY-OVERHEAD_ ::= 48
+  static DEFAULT-MAX-BYTES ::= 16_384
+
+  max-bytes_/int
+  bytes_/int := 0
   last-cleanup-us_/int := 0
+
+  constructor --max-bytes/int=DEFAULT-MAX-BYTES:
+    max-bytes_ = max-bytes
+
+  /** Returns the estimated retained memory in bytes. */
+  bytes -> int:
+    return bytes_
 
   /**
   Adds or refreshes $record in the cache.
@@ -43,6 +56,9 @@ class MdnsCache:
     second so multi-packet responses do not invalidate each other.
   */
   add record/dns.Resource -> none:
+    entry-size := estimate-size_ record
+    if entry-size > max-bytes_ / 4: return
+
     key := build-key_ record.name record.type dns.CLASS-INTERNET
     list := records_.get key --init=(: [])
 
@@ -53,18 +69,24 @@ class MdnsCache:
     if record.flush:
       flush-cutoff := now - 1_000_000
       list.filter --in-place: | entry/CacheEntry |
-        (dns-helper.resource-equals entry.record record) or entry.received-us > flush-cutoff
+        keep := (dns-helper.resource-equals entry.record record) or entry.received-us > flush-cutoff
+        if not keep: bytes_ -= entry.size
+        keep
 
     list.size.repeat: | i |
       entry/CacheEntry := list[i]
       if dns-helper.resource-equals entry.record record:
-        list[i] = CacheEntry record now expiry
+        bytes_ += entry-size - entry.size
+        list[i] = CacheEntry record now expiry entry-size
+        if bytes_ > max-bytes_: evict-to-budget_ (max-bytes_ * 3 / 4)
         return
 
     if list.size >= MAX-ENTRIES-PER-KEY_:
       evict-oldest-in-list_ list
-    list.add (CacheEntry record now expiry)
+    list.add (CacheEntry record now expiry entry-size)
+    bytes_ += entry-size
     if records_.size > MAX-KEYS_: evict-one_
+    if bytes_ > max-bytes_: evict-to-budget_ (max-bytes_ * 3 / 4)
 
   /** Returns unexpired $dns.Resource records for $name and $type. */
   lookup name/string type/int -> List:
@@ -114,10 +136,14 @@ class MdnsCache:
     if now - last-cleanup-us_ < CLEANUP-INTERVAL-US_: return
     last-cleanup-us_ = now
 
+    new-bytes := 0
     records_.filter --in-place: | _ list/List |
       list.filter --in-place: | entry/CacheEntry |
-        entry.expiry > now
+        keep := entry.expiry > now
+        if keep: new-bytes += entry.size
+        keep
       not list.is-empty
+    bytes_ = new-bytes
 
   evict-oldest-in-list_ list/List -> none:
     if list.is-empty: return
@@ -128,7 +154,9 @@ class MdnsCache:
       if exp < oldest-expiry:
         oldest-expiry = exp
         oldest-idx = i
+    removed := list[oldest-idx] as CacheEntry
     list.remove --at=oldest-idx
+    bytes_ -= removed.size
 
   evict-one_ -> none:
     earliest-key/string? := null
@@ -138,7 +166,44 @@ class MdnsCache:
         if entry.expiry < earliest-expiry:
           earliest-expiry = entry.expiry
           earliest-key = key
-    if earliest-key: records_.remove earliest-key
+    if earliest-key:
+      removed-list := records_[earliest-key] as List
+      removed-list.do: | entry/CacheEntry | bytes_ -= entry.size
+      records_.remove earliest-key
+
+  evict-to-budget_ target-bytes/int -> none:
+    if bytes_ <= target-bytes: return
+    candidates := []
+    records_.do: | key list/List |
+      list.do: | entry/CacheEntry |
+        candidates.add [entry.expiry, key, entry]
+    candidates.sort --in-place: | a b | (a[0] as int) - (b[0] as int)
+    candidates.do: | item |
+      if bytes_ <= target-bytes: return
+      key := item[1] as string
+      entry := item[2] as CacheEntry
+      list/List? := records_.get key
+      if list:
+        list.remove entry
+        bytes_ -= entry.size
+        if list.is-empty: records_.remove key
+
+  static estimate-size_ record/dns.Resource -> int:
+    rdata-size := 0
+    if record is dns.AResource:
+      rdata-size = (record as dns.AResource).address.raw.size
+    else if record is dns.SrvResource:
+      rdata-size = 6 + (record as dns.SrvResource).value.size
+    else if record is dns.TxtResource:
+      txt := (record as dns.TxtResource).text
+      rdata-size = txt.size
+      txt.do: rdata-size += it.size
+    else if record is dns.StringResource:
+      rdata-size = (record as dns.StringResource).value.size
+    else if record is dns-helper.NsecResource:
+      nsec := record as dns-helper.NsecResource
+      rdata-size = nsec.next-domain.size + nsec.bitmap.size
+    return ENTRY-OVERHEAD_ + record.name.size + rdata-size
 
   build-key_ name/string type/int klass/int -> string:
     return "$(name.to-ascii-lower):$type:$klass"
