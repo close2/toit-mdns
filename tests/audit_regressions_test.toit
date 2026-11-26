@@ -25,8 +25,6 @@ import .support.capture
 
 /** Case names whose fix has not landed yet, with the phase that fixes them. */
 KNOWN-FAILING ::= {
-  "c1-aaaa-is-not-a-conflict",           // P3.
-  "c2-established-conflict-reprobes",    // P3.
   "s4-cross-hostname-denied",            // P4.
   "s4-no-hijack-on-shared-hostname",     // P4.
   "f2-services-removed-on-close",        // P4.
@@ -43,6 +41,9 @@ failures_ := []
 main:
   check "c1-aaaa-is-not-a-conflict": test-aaaa-is-not-a-conflict it
   check "c2-established-conflict-reprobes": test-established-conflict-reprobes it
+  check "c2-two-established-only-one-renames": test-two-established-only-one-renames it
+  check "c4-service-tiebreak-defers": test-service-tiebreak-defers it
+  check "c7-txt-update-announces-no-probe": test-txt-update-announces-no-probe it
   check "c3-packets-fit-mtu": test-packets-fit-mtu it
   check "c3-ka-query-splits-with-tc": test-ka-query-splits-with-tc it
   check "f1-invalid-names-rejected": test-invalid-names-rejected it
@@ -138,6 +139,61 @@ test-established-conflict-reprobes port/int:
     probe := capture.wait-for --timeout=(Duration --ms=1500): it.is-probe-for "reprobe-host.local"
     assert-not-null_ probe
     assert-equals_ "reprobe-host.local" manager.hostname
+
+test-two-established-only-one-renames port/int:
+  p1 := MdnsServiceProvider --port=port --local-ip=(net.IpAddress.parse "127.0.0.10")
+  p2 := MdnsServiceProvider --port=port --local-ip=(net.IpAddress.parse "127.0.0.20")
+  try:
+    p1.handle MdnsService.SET-HOSTNAME-INDEX "clash.local" --client=1 --gid=0
+    p2.handle MdnsService.SET-HOSTNAME-INDEX "clash.local" --client=2 --gid=0
+    m1/StateManager := p1.managers_["clash.local"]
+    m2/StateManager := p2.managers_["clash.local"]
+    deadline := Time.monotonic-us + 6_000_000
+    while (m1.state_ != StateManager.STATE-ESTABLISHED or m2.state_ != StateManager.STATE-ESTABLISHED):
+      if Time.monotonic-us > deadline: throw "managers did not settle"
+      sleep --ms=50
+    names := {m1.hostname, m2.hostname}
+    assert-true_ (names.contains "clash.local") --message="neither kept clash.local: $names"
+    assert-true_ (names.contains "clash-2.local") --message="neither renamed to clash-2.local: $names"
+  finally:
+    p1.close
+    p2.close
+
+test-service-tiebreak-defers port/int:
+  with-manager port "tie-svc.local": | manager/StateManager capture/PacketCapture |
+    manager.register-service "_http._tcp" 80 --name="MySvc"
+    manager.start
+    sleep --ms=300  // Ensure probing has started.
+    capture.clear
+    // Send a probe for the same service with a higher SRV port (wins tiebreak).
+    q := [dns.Question "MySvc._http._tcp.local" dns.RECORD-ANY --unicast-ok]
+    auth := [
+      dns.SrvResource "MySvc._http._tcp.local" dns.RECORD-SRV 120 false "other.local" 0 0 9090,
+      dns.TxtResource "MySvc._http._tcp.local" 4500 false [""],
+    ]
+    probe-pkt := dns-helper.encode-mdns-packet q [] --is-response=false --authorities=auth
+    manager.process-packet (dns-helper.parse probe-pkt) --source=(net.SocketAddress PEER-IP port)
+    // Must defer (not rename immediately) and re-probe after ~1s with the same name.
+    assert-equals_ StateManager.STATE-PROBING manager.state_
+    early := capture.wait-for --timeout=(Duration --ms=600): it.is-probe-for "MySvc._http._tcp.local"
+    assert-null_ early
+    reprobe := capture.wait-for --timeout=(Duration --ms=1200): it.is-probe-for "MySvc._http._tcp.local"
+    assert-not-null_ reprobe
+
+test-txt-update-announces-no-probe port/int:
+  with-manager port "txt-upd.local": | manager/StateManager capture/PacketCapture |
+    manager.register-service "_http._tcp" 80 --name="App" --txt={"v": "1"}
+    manager.start
+    wait-established manager
+    capture.clear
+    manager.register-service "_http._tcp" 80 --name="App" --txt={"v": "2"}
+    // Must reach ESTABLISHED via 2 announcements without sending any probe.
+    sleep --ms=1300
+    assert-equals_ StateManager.STATE-ESTABLISHED manager.state_
+    probes := capture.filter: it.is-probe
+    assert-true_ probes.is-empty --message="TXT update must not probe"
+    ann := capture.filter: it.is-response and (it.mentions "App._http._tcp.local")
+    assert-true_ ann.size >= 2 --message="expected 2 announcements, got $ann.size"
 
 // --- P1: validation and packet size. ---
 
