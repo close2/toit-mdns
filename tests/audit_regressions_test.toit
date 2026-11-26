@@ -13,6 +13,7 @@ import system
 import mdns.api.mdns-service show MdnsService
 import mdns.client show Client
 import mdns.net.dns-helper as dns-helper
+import mdns.net.ip-scope as ip-scope
 import mdns.net.mdns-socket show MdnsSocket
 import mdns.server.cache show MdnsCache
 import mdns.server.conflict-manager show ConflictManager
@@ -55,6 +56,9 @@ main:
   check "s4-service-quota-and-rpc-validation": test-service-quota-and-rpc-validation it
   check "f2-services-removed-on-close": test-services-removed-on-close it
   check "f2-unregister-service-sends-goodbye": test-unregister-service-sends-goodbye it
+  check "s3-off-link-filter-and-unicast-ratelimit": test-off-link-filter-and-unicast-ratelimit it
+  check "f4-close-closes-network": test-close-closes-network it
+  check "p5-ip-refresh-goodbye-and-reprobe": test-ip-refresh-goodbye-and-reprobe it
   check "f5-lookup-throws-dns-exception": test-lookup-throws-dns-exception it
 
   if not failures_.is-empty:
@@ -442,6 +446,99 @@ test-service-quota-and-rpc-validation port/int:
     expect-throws: provider.handle MdnsService.LOOKUP-INDEX ["a.local", "not-bool", false, 100] --client=1 --gid=0
     expect-throws: provider.handle MdnsService.REGISTER-INDEX ["_http._tcp", 70000, null, "badport"] --client=1 --gid=0
     expect-throws: provider.handle MdnsService.UNREGISTER-INDEX [123, null] --client=1 --gid=0
+
+test-off-link-filter-and-unicast-ratelimit port/int:
+  local := net.IpAddress.parse "192.168.1.50"
+  // Tier A: rejects public IP when local-ip is private, allows private/loopback.
+  assert-true_ (not (ip-scope.is-local-source (net.IpAddress.parse "8.8.8.8") local))
+  assert-true_ (ip-scope.is-local-source (net.IpAddress.parse "10.99.0.1") local)
+  assert-true_ (ip-scope.is-local-source (net.IpAddress.parse "127.0.0.1") local)
+  assert-true_ (ip-scope.is-local-source (net.IpAddress.parse "169.254.1.2") local)
+  // Tier B: strict /24 prefix rejects 10.99.0.1 and 192.168.2.1, allows 192.168.1.99.
+  assert-true_ (not (ip-scope.is-local-source (net.IpAddress.parse "10.99.0.1") local --prefix-length=24))
+  assert-true_ (not (ip-scope.is-local-source (net.IpAddress.parse "192.168.2.1") local --prefix-length=24))
+  assert-true_ (ip-scope.is-local-source (net.IpAddress.parse "192.168.1.99") local --prefix-length=24)
+
+  // End-to-end on StateManager with Tier B and legacy unicast rate limit (4/sec).
+  network := net.open
+  real-local := network.address
+  off-prefix := net.IpAddress #[real-local.raw[0] ^ 1, 99, 0, 1]
+  socket := MdnsSocket --network=network --port=port
+  sink := network.udp-open --port=0
+  sink-port := sink.local-address.port
+  manager := StateManager socket ConflictManager "scope-host.local" real-local
+      --expected-port=port
+      --local-prefix-length=24
+  try:
+    manager.start
+    wait-established manager
+    q := dns-helper.encode-mdns-packet [dns.Question "scope-host.local" dns.RECORD-A] [] --id=0x1111 --is-response=false
+    decoded := dns-helper.parse q
+
+    // Off-prefix query is dropped; same-prefix real-local is accepted.
+    manager.process-packet decoded --source=(net.SocketAddress off-prefix sink-port)
+    replies := 0
+    done := false
+    reader := task::
+      while not done:
+        err := catch:
+          with-timeout (Duration --ms=400):
+            sink.receive
+            replies++
+        if err: break
+    6.repeat:
+      manager.process-packet decoded --source=(net.SocketAddress real-local sink-port)
+    sleep --ms=500
+    done = true
+    reader.cancel
+    assert-equals_ 4 replies
+  finally:
+    manager.stop
+    catch: sink.close
+    socket.close
+
+test-close-closes-network port/int:
+  // Owns network = true (default): closing MdnsSocket closes the network handle.
+  n1 := net.open
+  s1 := MdnsSocket --network=n1 --port=port
+  s1.close
+  expect-throws: n1.udp-open --port=0
+
+  // Owns network = false: closing MdnsSocket leaves the network handle open.
+  n2 := net.open
+  s2 := MdnsSocket --network=n2 --port=port --no-owns-network
+  s2.close
+  u := n2.udp-open --port=0
+  u.close
+  n2.close
+
+  // Repeated provider open/close cycles do not leak handles or fail.
+  20.repeat: | i |
+    p := MdnsServiceProvider --port=(port + 50 + i)
+    p.handle MdnsService.SET-HOSTNAME-INDEX "churn-$(i).local" --client=1 --gid=0
+    p.close
+
+test-ip-refresh-goodbye-and-reprobe port/int:
+  capture := PacketCapture --port=port
+  socket := MdnsSocket --network=net.open --port=port
+  old-ip := net.IpAddress.parse "10.0.0.11"
+  new-ip := net.IpAddress.parse "10.0.0.22"
+  manager := StateManager socket ConflictManager "ipchange.local" old-ip --expected-port=port
+  try:
+    manager.start
+    wait-established manager
+    capture.clear
+    manager.update-network socket new-ip
+    goodbye := capture.wait-for --timeout=(Duration --ms=1000): | p/CapturedPacket |
+      p.is-response and p.all-records.any: | r/dns.Resource |
+        r.ttl == 0 and r is dns.AResource and (r as dns.AResource).address == old-ip
+    assert-not-null_ goodbye
+    reprobe := capture.wait-for --timeout=(Duration --ms=1500): it.is-probe-for "ipchange.local"
+    assert-not-null_ reprobe
+  finally:
+    manager.stop
+    socket.close
+    capture.close
 
 // --- P6: client API. ---
 

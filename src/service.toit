@@ -13,6 +13,7 @@ import system.services
 
 import .api.mdns-service
 import .net.dns-helper as dns
+import .net.ip-scope as ip-scope
 import .net.mdns-socket
 import .net.names as names
 import .server.cache
@@ -54,11 +55,13 @@ class MdnsServiceProvider extends services.ServiceProvider
   cache_/MdnsCache? := null
   query-engine_/QueryEngine? := null
   receive-task_/Task? := null
+  ip-refresh-task_/Task? := null
 
   group/net.IpAddress
   port/int
   local-ip/net.IpAddress?
   cache-max-bytes/int
+  local-prefix-length/int?
   resolved-local-ip_/net.IpAddress? := null
 
   local-client-counter_/int := -1
@@ -68,7 +71,8 @@ class MdnsServiceProvider extends services.ServiceProvider
       --.port/int=MDNS-PORT
       --.group/net.IpAddress=MDNS-MULTICAST-ADDRESS
       --.local-ip/net.IpAddress?=null
-      --.cache-max-bytes/int=MdnsCache.DEFAULT-MAX-BYTES:
+      --.cache-max-bytes/int=MdnsCache.DEFAULT-MAX-BYTES
+      --.local-prefix-length/int?=null:
     super "mdns" --major=1 --minor=0
     provides MdnsService.SELECTOR --handler=this
 
@@ -268,7 +272,9 @@ class MdnsServiceProvider extends services.ServiceProvider
 
     if not managers_.contains key:
       cm := ConflictManager
-      manager := StateManager socket_ cm name resolved-local-ip_ --expected-port=port
+      manager := StateManager socket_ cm name resolved-local-ip_
+          --expected-port=port
+          --local-prefix-length=local-prefix-length
       managers_[key] = manager
       manager.start
 
@@ -302,12 +308,37 @@ class MdnsServiceProvider extends services.ServiceProvider
 
     // If the receive loop is still alive (e.g. backing off after a socket
     // error), it picks up the new $socket_ itself; don't start a second one.
-    if receive-task_: return
-    receive-task_ = task::
-      try:
-        receive-loop_
-      finally:
-        if receive-task_ == Task.current: receive-task_ = null
+    if not receive-task_:
+      receive-task_ = task::
+        try:
+          receive-loop_
+        finally:
+          if receive-task_ == Task.current: receive-task_ = null
+
+    if local-ip == null and not ip-refresh-task_:
+      ip-refresh-task_ = task::
+        try:
+          ip-refresh-loop_
+        finally:
+          if ip-refresh-task_ == Task.current: ip-refresh-task_ = null
+
+  ip-refresh-loop_ -> none:
+    while not closed_:
+      sleep (Duration --s=30)
+      if closed_: return
+      refresh-local-ip_
+
+  refresh-local-ip_ -> none:
+    if local-ip != null or not socket_ or socket_.is-closed or managers_.is-empty:
+      return
+    new-ip/net.IpAddress? := null
+    catch: new-ip = socket_.network-address
+    if new-ip and new-ip != resolved-local-ip_:
+      log.info "Local IP changed; updating mDNS responders"
+          --tags={"old": resolved-local-ip_, "new": new-ip}
+      resolved-local-ip_ = new-ip
+      managers_.do: | _ manager/StateManager |
+        manager.update-network socket_ new-ip
 
   open-socket-and-bind_ -> none:
     network := net.open
@@ -340,6 +371,9 @@ class MdnsServiceProvider extends services.ServiceProvider
         if closed_: return
         if not datagram: continue
 
+        if not ip-scope.is-local-source datagram.address.ip resolved-local-ip_
+            --prefix-length=local-prefix-length:
+          continue
         packet-bytes := datagram.data
         // Zero-allocation header & port check before constructing DecodedPacket:
         // - RFC 6762 §18.3 / §18.11: Ignore non-zero OPCODE or RCODE.
@@ -410,6 +444,9 @@ class MdnsServiceProvider extends services.ServiceProvider
     closed_ = true
     managers_.do: | _ manager/StateManager |
       manager.stop
+    if ip-refresh-task_:
+      ip-refresh-task_.cancel
+      ip-refresh-task_ = null
     if receive-task_:
       receive-task_.cancel
       receive-task_ = null

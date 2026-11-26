@@ -40,13 +40,16 @@ class MdnsSocket:
   socket_/udp.MulticastSocket
   mdns-target_/net.SocketAddress
   max-payload-size_/int := dns.MAX-MDNS-PACKET-SIZE
+  owns-network_/bool
   closed_/bool := false
 
   constructor
       --network/net.Client
       --group/net.IpAddress=MDNS-MULTICAST-ADDRESS
-      --port/int=MDNS-PORT:
+      --port/int=MDNS-PORT
+      --owns-network/bool=true:
     network_ = network
+    owns-network_ = owns-network
     mdns-target_ = net.SocketAddress group port
     socket_ = network.udp-open-multicast
         --port=port
@@ -65,11 +68,17 @@ class MdnsSocket:
   receive -> udp.Datagram?:
     return socket_.receive
 
-  /** Closes the underlying multicast socket idempotently. */
+  /** Closes the underlying multicast socket (and owned network) idempotently. */
   close -> none:
     if closed_: return
     closed_ = true
-    socket_.close
+    catch: socket_.close
+    if owns-network_:
+      catch: network_.close
+
+  /** Returns the current interface address of the underlying network. */
+  network-address -> net.IpAddress:
+    return network_.address
 
   /** Returns the local socket address. */
   local-address -> net.SocketAddress:
