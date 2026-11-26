@@ -23,8 +23,8 @@ import system
 import system.services show ServiceClient
 
 import .api.mdns-service
-import .net.dns-helper as dns-helper
-import .net.names as names
+import .private.dns-helper as dns-helper
+import .private.names as names
 import .service as service
 
 /// Error text used when a hostname lookup yields no matching IP address.

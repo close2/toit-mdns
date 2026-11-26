@@ -24,7 +24,7 @@ You can run the provider in two ways:
 
 **1. Install Provider**
 
-Create `mdns-provider.toit`:
+See [examples/provider.toit](examples/provider.toit) (or create `mdns-provider.toit`):
 
 ```toit
 import mdns.service show MdnsServiceProvider
@@ -96,20 +96,30 @@ This implementation targets RFC 6762 (mDNS) and RFC 6763 (DNS-SD).
 | **Probing**                  | 6762 | ✅ Implemented | 3 probes (QU), 250ms apart, 0–250ms jitter, 15-conflict rate limit. |
 | **Probe Tiebreaking**        | 6762 | ✅ Implemented | Sorted `(class, type, rdata)` Authority Section comparison (§8.2).  |
 | **Announcing & Goodbyes**    | 6762 | ✅ Implemented | 2 announcements 1s apart (§8.3) + voluntary `TTL=0` goodbyes (§10.1). |
-| **Conflict Resolution**      | 6762 | ✅ Implemented | Defends established names/services and renames on persistent conflict (§9). |
-| **Response Generation**      | 6762 | ✅ Implemented | Correct TTLs, `AA` bit, `cache-flush`, deduplicated aggregation.    |
+| **Conflict Resolution**      | 6762 | ✅ Implemented | Same-rrtype conflicts trigger re-probing and rename on persistent clash (§9). |
+| **Response Generation**      | 6762 | ✅ Implemented | Correct TTLs, `AA` bit, `cache-flush`, MTU splitting (§17), 20–120ms shared delay (§6). |
 | **Known-Answer Suppression** | 6762 | ✅ Implemented | Suppresses answers when query carries matching RR with TTL ≥ 50% (§7.1). |
+| **Duplicate Suppression**    | 6762 | ✅ Implemented | Cancels deferred PTR responses when a peer answers with TTL ≥ ours (§7.4). |
 | **Unicast Responses**        | 6762 | ✅ Implemented | `QU` bit (quarter-TTL rule) and legacy unicast responses (§5.4, §6.7). |
 | **Message Validation**       | 6762 | ✅ Implemented | Rejects non-zero `OPCODE`/`RCODE`, ignores `Z`/`AD`/`CD` (§18).     |
-| **Source Port Check**        | 6762 | ✅ Implemented | Rejects responses not from port 5353 in responder & querier (§6.10). |
+| **Source Port Check**        | 6762 | ✅ Implemented | Rejects responses not from port 5353 in responder & querier (§6).    |
 | **Response Rate Limiting**   | 6762 | ✅ Implemented | Deferred multicast scheduling: max 1/s (250ms on probe defense, §6). |
-| **NSEC Negative Responses**  | 6762 | ✅ Implemented | Restricted-form `NSEC` for unique host & service names (§6.1).      |
-| **Truncated Packets (TC)**   | 6762 | ❌ Not impl.   | Multi-packet Known-Answer continuations not supported.              |
+| **NSEC Negative Responses**  | 6762 | ✅ Implemented | Restricted-form `NSEC` for unique host/service names & A additionals (§6.1). |
+| **Truncated Packets (TC)**   | 6762 | ❌ Not impl.   | Multi-packet Known-Answer continuation buffering not supported (§7.2). |
 | **Service Registration**     | 6763 | ✅ Implemented | `PTR`, `SRV`, `TXT`, `A`, and `_services._dns-sd._udp.local` (§9).  |
 | **Service Enumeration**      | 6763 | ✅ Implemented | Multi-responder `PTR` browsing with aggregation & Known-Answers.    |
 | **Service Resolution**       | 6763 | ✅ Implemented | Resolving Service Instance Names (`SRV` + `TXT` + `A`).             |
-| **TXT Record Strings**       | 6763 | ✅ Implemented | Multi-key, boolean/valueless, and binary `<character-string>` support (§6). |
+| **TXT Record Strings**       | 6763 | ✅ Implemented | Validated multi-key, boolean/valueless, and binary `<character-string>` (§6). |
+| **Dotted Instance Names**    | 6763 | ❌ Not impl.   | Dots inside service instance names are rejected at registration.    |
 | **Subtypes**                 | 6763 | ❌ Not impl.   | Browsing by `_sub` subtype not supported.                           |
+
+## Security Considerations
+
+- **LAN Trust Model**: mDNS (RFC 6762) has no cryptographic authentication; peers on the same local link can answer queries and assert name conflicts.
+- **Off-Link Filtering**: Because the Toit v2.0.0 UDP API does not expose packet destination addresses or interface netmasks, `MdnsServiceProvider` drops packets from publicly routable IP addresses whenever the host IP is private/local (blocking off-link reflection). Pass `--local-prefix-length=N` on `MdnsServiceProvider` to enforce a strict subnet prefix match, and legacy unicast replies are rate-limited to 4/s per source IP.
+- **Multi-Container Isolation**: Clients sharing an `MdnsServiceProvider` can only register services on their own committed hostname, cannot overwrite or unregister services owned by another client, and have per-client quotas (8 services, 4 concurrent lookups) and per-hostname quotas (16 services). Services are automatically unregistered with `TTL=0` goodbyes when a client closes.
+- **Memory Bounds**: `MdnsCache` defaults to a 16 KB byte budget (`--cache-max-bytes`), caches only pending lookup names and their 2-hop DNS-SD additionals, and decodes `NSEC` bitmaps into a bounded 32-byte Window 0 `ByteArray`.
+- **Internal Modules**: Implementation details live under `src/private/` and are not part of the public API; import only `mdns.client`, `mdns.service`, and `mdns.api.mdns-service`.
 
 ## Why use `Client`?
 

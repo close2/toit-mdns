@@ -1,7 +1,7 @@
 // Generates tests/corpus/packets.toit. Run from the repo root:
 //   toit tests/corpus/generate.toit > tests/corpus/packets.toit
 import encoding.hex
-import mdns.net.dns-helper as dns
+import mdns.private.dns-helper as dns
 
 name_ parts/List -> ByteArray:
   out := #[]

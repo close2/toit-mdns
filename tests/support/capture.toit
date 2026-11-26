@@ -8,8 +8,8 @@ Opens a second mDNS socket on the test port and records every datagram it
 
 import net
 import net.modules.dns
-import mdns.net.dns-helper as dns-helper
-import mdns.net.mdns-socket show MdnsSocket
+import mdns.private.dns-helper as dns-helper
+import mdns.private.mdns-socket show MdnsSocket
 
 /** A single captured datagram. */
 class CapturedPacket:
