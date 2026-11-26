@@ -59,9 +59,6 @@ class StateManager:
   first-probe-sent_/bool := false
   stopped_/bool := false
 
-  defend-count_/int := 0
-  last-defend-time_/int := 0
-
   conflict-count_/int := 0
   conflict-window-start_/int := 0
 
@@ -132,7 +129,10 @@ class StateManager:
           (existing.original-instance-name == instance-name or existing.instance-name == instance-name):
         if existing.port == port and (txt-equals_ existing.txt txt): return
         services_[i] = RegisteredService type existing.original-instance-name existing.instance-name port txt
-        enter-probing_
+        if state_ == STATE-ANNOUNCING or state_ == STATE-ESTABLISHED:
+          announce-now_
+        else:
+          enter-probing_
         return
     services_.add (RegisteredService type instance-name instance-name port txt)
     enter-probing_
@@ -225,7 +225,7 @@ class StateManager:
     if dns.is-authoritative-response-for decoded hostname_:
       is-conflict := false
       dns.do-response-records-for decoded hostname_: | res/dns.Resource |
-        if res is dns.AResource:
+        if res.type == dns.RECORD-A and res is dns.AResource:
           addr := (res as dns.AResource).address
           if addr != local-ip_:
             is-conflict = true
@@ -235,8 +235,8 @@ class StateManager:
           handle-probing-conflict_
           return
         else if state_ == STATE-ANNOUNCING or state_ == STATE-ESTABLISHED:
-          handle-established-conflict_
-          if state_ == STATE-PROBING: return
+          restart-probing-keeping-name_
+          return
 
     // --- Service-instance tiebreaking & conflict detection (RFC 6762 §8 / §9) ---
     services_.size.repeat: | i |
@@ -248,13 +248,13 @@ class StateManager:
         ]
         cmp := dns.compare-probe-tiebreak our-srv-records decoded.authorities s.full-name
         if cmp != null and cmp < 0:
-          log.info "Service-instance probe lost, renaming" --tags={"service": s.full-name}
-          handle-service-conflict_ i
+          log.info "Service-instance probe tiebreak lost, deferring" --tags={"service": s.full-name}
+          defer-probing-one-second_
           return
       if dns.is-authoritative-response-for decoded s.full-name:
         is-srv-conflict := false
         dns.do-response-records-for decoded s.full-name: | res/dns.Resource |
-          if res is dns.SrvResource:
+          if res.type == dns.RECORD-SRV and res is dns.SrvResource:
             srv := res as dns.SrvResource
             if not (dns.name-equals srv.value hostname_) or srv.port != s.port:
               is-srv-conflict = true
@@ -263,8 +263,8 @@ class StateManager:
             handle-service-conflict_ i
             return
           else if state_ == STATE-ANNOUNCING or state_ == STATE-ESTABLISHED:
-            handle-established-service-conflict_ i
-            if state_ == STATE-PROBING: return
+            restart-probing-keeping-name_
+            return
 
     if state_ != STATE-ANNOUNCING and state_ != STATE-ESTABLISHED: return
 
@@ -272,6 +272,7 @@ class StateManager:
       send-response_ decoded --source=source
 
   defer-probing-one-second_ -> none:
+    record-conflict_
     probe-generation_++
     probe-count_ = 0
     first-probe-sent_ = false
@@ -299,7 +300,6 @@ class StateManager:
     state_ = STATE-PROBING
     probe-count_ = 0
     first-probe-sent_ = false
-    defend-count_ = 0
     probe-generation_++
     cancel-deferred-multicast_
 
@@ -342,22 +342,10 @@ class StateManager:
     rebuild-host-records_
     enter-probing_
 
-  handle-established-conflict_ -> none:
-    now := Time.monotonic-us
-    if now - last-defend-time_ > 10_000_000:
-      defend-count_ = 0
-
-    if defend-count_ < 3:
-      log.warn "Defending name" --tags={"hostname": hostname_}
-      defend-count_++
-      last-defend-time_ = now
-      send-defense_
-    else:
-      log.warn "Conflict persistence detected. Renaming..." --tags={"hostname": hostname_}
-      record-conflict_
-      hostname_ = conflict-manager_.resolve-established-conflict hostname_
-      rebuild-host-records_
-      enter-probing_
+  restart-probing-keeping-name_ -> none:
+    log.warn "Conflict detected while established; resetting to probing" --tags={"hostname": hostname_}
+    record-conflict_
+    enter-probing_
 
   handle-service-conflict_ i/int -> none:
     record-conflict_
@@ -368,16 +356,17 @@ class StateManager:
         --tags={"old": s.instance-name, "new": new-instance}
     enter-probing_
 
-  handle-established-service-conflict_ i/int -> none:
-    now := Time.monotonic-us
-    if now - last-defend-time_ > 10_000_000:
-      defend-count_ = 0
-    if defend-count_ < 3:
-      defend-count_++
-      last-defend-time_ = now
-      send-defense_
-    else:
-      handle-service-conflict_ i
+  announce-now_ -> none:
+    if stopped_: return
+    probe-generation_++
+    cancel-deferred-multicast_
+    if probe-timer_: probe-timer_.cancel
+    my-generation := probe-generation_
+    probe-timer_ = task::
+      try:
+        enter-announcing_ my-generation
+      finally:
+        if probe-timer_ == Task.current: probe-timer_ = null
 
   record-conflict_ -> none:
     now := Time.monotonic-us
@@ -462,11 +451,6 @@ class StateManager:
     answers.do: | rec/dns.Resource |
       last-multicast-times_[record-rate-key_ rec] = now
     send-raw_ --queries=[] --records=answers --is-response --is-authoritative
-
-  send-defense_ -> none:
-    if socket_.is-closed: return
-    enqueue-or-send-multicast_ build-full-announcement-records_ Time.monotonic-us
-        --min-interval-us=PROBE-DEFENSE-RATE-LIMIT-US_
 
   send-goodbye_ -> none:
     if socket_.is-closed: return
