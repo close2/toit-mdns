@@ -10,6 +10,7 @@ import net
 import net.modules.dns
 import ..net.mdns-socket
 import ..net.dns-helper as dns
+import ..net.names as names
 import .conflict-manager
 
 class DeferredRecord_:
@@ -80,7 +81,7 @@ class StateManager:
   The $hostname must end with `.local` (case-insensitive).
   */
   constructor .socket_ .conflict-manager_ hostname/string .local-ip_ --expected-port/int=5353:
-    assert: dns.has-local-suffix hostname
+    assert: names.validate-hostname hostname
     hostname_ = hostname
     expected-port_ = expected-port
 
@@ -100,6 +101,9 @@ class StateManager:
   register-service type/string port/int -> none
       --txt/Map?=null
       --name/string?=null:
+    assert: names.validate-service-type type
+    if name: assert: names.validate-instance-name name
+    assert: names.validate-txt txt
     instance-name := name or (hostname_.copy 0 hostname_.size - 6)
     // Dedup across reconnects: match both original-instance-name and the
     // conflict-renamed instance-name so re-registering after a rename keeps
@@ -165,7 +169,7 @@ class StateManager:
   Updates the hostname and restarts probing if it changed.
   */
   set-hostname new-hostname/string -> none:
-    assert: dns.has-local-suffix new-hostname
+    assert: names.validate-hostname new-hostname
     if dns.name-equals hostname_ new-hostname: return
     if not stopped_ and (state_ == STATE-ANNOUNCING or state_ == STATE-ESTABLISHED):
       send-host-goodbye_ hostname_
@@ -374,18 +378,53 @@ class StateManager:
 
   send-probe_ -> none:
     if socket_.is-closed: return
-    // RFC 6762 §8.1: Probe questions SHOULD set the QU (unicast-response) bit.
-    questions := [dns.Question hostname_ dns.RECORD-ANY --unicast-ok]
+    max-size := socket_.max-payload-size
+    // Group each name's Question with its Authority records so split probes
+    // keep matching Questions and Authorities together per RFC 6762 §8.2.
+    groups := [
+      [
+        [dns.Question hostname_ dns.RECORD-ANY --unicast-ok],
+        [dns.AResource hostname_ 120 local-ip_],
+      ],
+    ]
     services_.do: | s/RegisteredService |
-      questions.add (dns.Question s.full-name dns.RECORD-ANY --unicast-ok)
+      groups.add [
+        [dns.Question s.full-name dns.RECORD-ANY --unicast-ok],
+        [
+          dns.SrvResource s.full-name dns.RECORD-SRV 120 false hostname_ 0 0 s.port,
+          dns.TxtResource s.full-name 4500 false (build-txt-list_ s.txt),
+        ],
+      ]
 
-    // RFC 6762 §8.2: Include ALL proposed unique records in the Authority Section.
-    authorities := [dns.AResource hostname_ 120 local-ip_]
-    services_.do: | s/RegisteredService |
-      authorities.add (dns.SrvResource s.full-name dns.RECORD-SRV 120 false hostname_ 0 0 s.port)
-      authorities.add (dns.TxtResource s.full-name 4500 false (build-txt-list_ s.txt))
-
-    send-raw_ --queries=questions --records=[] --no-is-response --authorities=authorities
+    batch-q := []
+    batch-auth := []
+    groups.do: | group/List |
+      gq := group[0] as List
+      ga := group[1] as List
+      if not batch-q.is-empty:
+        cand-q := batch-q.copy
+        cand-q.add-all gq
+        cand-auth := batch-auth.copy
+        cand-auth.add-all ga
+        fits := false
+        catch:
+          pkts := dns.encode-mdns-packets cand-q []
+              --is-response=false
+              --authorities=cand-auth
+              --max-size=max-size
+          fits = pkts.size == 1
+        if fits:
+          batch-q = cand-q
+          batch-auth = cand-auth
+        else:
+          send-raw_ --queries=batch-q --records=[] --no-is-response --authorities=batch-auth
+          batch-q = gq.copy
+          batch-auth = ga.copy
+      else:
+        batch-q.add-all gq
+        batch-auth.add-all ga
+    if not batch-q.is-empty:
+      send-raw_ --queries=batch-q --records=[] --no-is-response --authorities=batch-auth
 
   build-full-announcement-records_ -> List:
     answers := [dns.AResource hostname_ 120 local-ip_ --flush]
@@ -692,19 +731,27 @@ class StateManager:
       --additionals/List=[]
       --target/net.SocketAddress?=null:
     if socket_.is-closed: return
-    err := catch:
-      packet := dns.encode-mdns-packet queries records
+    packets/List? := null
+    encode-err := catch:
+      packets = dns.encode-mdns-packets queries records
           --id=id
           --is-response=is-response
           --is-authoritative=is-authoritative
           --authorities=authorities
           --additionals=additionals
-      if target:
-        socket_.send packet target
-      else:
-        socket_.send packet
-    if err:
-      log.debug "mDNS send skipped" --tags={"error": err}
+          --max-size=socket_.max-payload-size
+    if encode-err or not packets:
+      record-names := records.map: | r/dns.Resource | r.name
+      log.error "mDNS encode failed" --tags={"error": encode-err, "records": record-names}
+      return
+    packets.do: | packet/ByteArray |
+      send-err := catch:
+        if target:
+          socket_.send packet target
+        else:
+          socket_.send packet
+      if send-err:
+        log.debug "mDNS send skipped" --tags={"error": send-err}
 
   prune-last-multicast-times_ now/int -> none:
     if last-multicast-times_.size <= 32: return
@@ -749,13 +796,13 @@ class StateManager:
       else if v is ByteArray:
         prefix := "$key-str=".to-byte-array
         raw := v as ByteArray
-        max-val := 255 - prefix.size
-        if max-val >= 0:
-          clipped := raw.size > max-val ? raw[..max-val] : raw
-          list.add (prefix + clipped)
+        if prefix.size + raw.size > 255:
+          throw "INVALID_TXT: entry for '$key-str' exceeds 255 octets"
+        list.add (prefix + raw)
       else:
         entry := "$key-str=$v"
-        entry = dns.truncate-utf8 entry 255
+        if entry.size > 255:
+          throw "INVALID_TXT: entry for '$key-str' exceeds 255 octets"
         list.add entry
     return list.is-empty ? [""] : list
 

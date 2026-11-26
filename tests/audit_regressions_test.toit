@@ -25,9 +25,6 @@ import .support.capture
 KNOWN-FAILING ::= {
   "c1-aaaa-is-not-a-conflict",           // P3.
   "c2-established-conflict-reprobes",    // P3.
-  "c3-packets-fit-mtu",                  // P1.
-  "f1-invalid-names-rejected",           // P1.
-  "f3-dotted-instance-rejected",         // P1.
   "s1-cache-byte-budget",                // P2.
   "s2-nsec-bitmap-bounded",              // P2.
   "s4-cross-hostname-denied",            // P4.
@@ -47,6 +44,7 @@ main:
   check "c1-aaaa-is-not-a-conflict": test-aaaa-is-not-a-conflict it
   check "c2-established-conflict-reprobes": test-established-conflict-reprobes it
   check "c3-packets-fit-mtu": test-packets-fit-mtu it
+  check "c3-ka-query-splits-with-tc": test-ka-query-splits-with-tc it
   check "f1-invalid-names-rejected": test-invalid-names-rejected it
   check "f3-dotted-instance-rejected": test-dotted-instance-rejected it
   check "s1-cache-byte-budget": test-cache-byte-budget it
@@ -143,16 +141,33 @@ test-established-conflict-reprobes port/int:
 test-packets-fit-mtu port/int:
   with-manager port "big-host.local": | manager/StateManager capture/PacketCapture |
     10.repeat: | i |
-      manager.register-service "_http._tcp" (8000 + i) --name="svc-$i" --txt={"d": "x" * 400}
+      manager.register-service "_http._tcp" (8000 + i) --name="svc-$i" --txt={"d1": "x" * 200, "d2": "y" * 200}
     manager.start
     wait-established manager
-    responses := capture.filter: it.is-response and it.mentions "big-host.local"
+    probes := capture.filter: it.is-probe
+    assert-true_ (not probes.is-empty) --message="no probes captured"
+    probes.do: | p/CapturedPacket |
+      assert-true_ p.data.size <= 1440 --message="probe packet of $p.data.size bytes exceeds 1440"
+    responses := capture.filter: it.is-response
     assert-true_ (not responses.is-empty)
     responses.do: | p/CapturedPacket |
       assert-true_ p.data.size <= 1440 --message="packet of $p.data.size bytes exceeds 1440"
     10.repeat: | i |
-      seen := responses.any: | p/CapturedPacket | p.mentions "svc-$i._http._tcp.local"
+      seen := responses.any: | p/CapturedPacket | p.mentions "svc-$(i)._http._tcp.local"
       assert-true_ seen --message="svc-$i never announced"
+
+test-ka-query-splits-with-tc port/int:
+  questions := [dns.Question "_http._tcp.local" dns.RECORD-PTR]
+  known := List 25: | i |
+    dns.StringResource "_http._tcp.local" dns.RECORD-PTR 4500 false "svc-$(i)-with-padding._http._tcp.local"
+  packets := dns-helper.encode-mdns-packets questions known --is-response=false --max-size=300
+  assert-true_ packets.size >= 2 --message="expected split query packets"
+  packets.size.repeat: | i |
+    pkt := packets[i] as ByteArray
+    assert-true_ pkt.size <= 300 --message="query packet $i is $pkt.size > 300"
+    decoded := dns-helper.parse pkt
+    is-last := i == packets.size - 1
+    assert-equals_ (not is-last) decoded.is-truncated
 
 with-client port/int hostname/string [block] -> none:
   with-provider port: | provider/MdnsServiceProvider |
@@ -163,13 +178,40 @@ with-client port/int hostname/string [block] -> none:
       client.close
 
 test-invalid-names-rejected port/int:
-  with-client port "names-host.local": | client/Client _ |
+  with-client port "names-host.local": | client/Client provider/MdnsServiceProvider |
+    // Instance name errors.
     expect-throws: client.register-service "_http._tcp" 80 --name=("x" * 64)
+    expect-throws: client.register-service "_http._tcp" 80 --name=""
+    expect-throws: client.register-service "_http._tcp" 80 --name="bad\nname"
+    // Service type errors.
     expect-throws: client.register-service "http" 80 --name="ok"
+    expect-throws: client.register-service "_http._tcp.local" 80 --name="ok"
     expect-throws: client.register-service "_waytoolongservicename._tcp" 80 --name="ok"
+    expect-throws: client.register-service "_123._tcp" 80 --name="ok"
+    expect-throws: client.register-service "_-bad._tcp" 80 --name="ok"
+    expect-throws: client.register-service "_bad-._tcp" 80 --name="ok"
+    expect-throws: client.register-service "_bad_svc._tcp" 80 --name="ok"
+    // TXT errors.
     expect-throws: client.register-service "_http._tcp" 80 --name="ok" --txt={"a=b": "c"}
+    expect-throws: client.register-service "_http._tcp" 80 --name="ok" --txt={"": "c"}
+    expect-throws: client.register-service "_http._tcp" 80 --name="ok" --txt={"Key": "1", "key": "2"}
     expect-throws: client.register-service "_http._tcp" 80 --name="ok" --txt={"k": "v" * 300}
+    big-txt := {:}
+    6.repeat: | i | big-txt["k$i"] = "v" * 210
+    expect-throws: client.register-service "_http._tcp" 80 --name="ok" --txt=big-txt
+    // Hostname errors (both Client and direct RPC).
     expect-throws: client.set-hostname "$("h" * 64).local"
+    expect-throws: client.set-hostname "a.b.local"
+    expect-throws: client.set-hostname "no-suffix"
+    expect-throws:
+      provider.handle MdnsService.SET-HOSTNAME-INDEX "bad..local" --client=99 --gid=0
+    expect-throws:
+      provider.handle MdnsService.REGISTER-INDEX ["badtype", 80, null, "ok", "names-host.local"] --client=99 --gid=0
+    // Verify the valid hostname kept working and was not poisoned.
+    assert-equals_ "names-host.local" client.hostname
+    sleep --ms=2200
+    ips := provider.lookup "names-host.local" --accept-ipv4=true --accept-ipv6=false --timeout-us=1_000_000
+    assert-true_ (not ips.is-empty)
 
 test-dotted-instance-rejected port/int:
   with-client port "dots-host.local": | client/Client _ |

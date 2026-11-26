@@ -146,11 +146,14 @@ test-multi-and-binary-txt-roundtrip:
   expect-equals 1 bin-entry.size
   expect-equals ("bin=".to-byte-array + #[0xff, 0x00, 0x41]) bin-entry[0]
 
-  // Long multi-byte values must be clamped to 255 octets without splitting a rune.
-  long-entries := sm.build-txt-list_ {"k": "é" * 200}
-  expect-equals 1 long-entries.size
-  expect (long-entries[0].size <= 255)
-  expect (long-entries[0].to-byte-array.is-valid-string-content)
+  // Long multi-byte values must be rejected instead of silently truncated.
+  long-err := catch: sm.build-txt-list_ {"k": "é" * 200}
+  expect-not-null long-err
+
+  // Verify truncate-utf8 still clamps without splitting multi-byte runes (used by ConflictManager).
+  clamped := dns-helper.truncate-utf8 ("é" * 200) 63
+  expect (clamped.size <= 63)
+  expect (clamped.to-byte-array.is-valid-string-content)
   print "  PASS"
 
 test-hostname-case-preserved:

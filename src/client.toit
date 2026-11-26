@@ -24,6 +24,7 @@ import system.services show ServiceClient
 
 import .api.mdns-service
 import .net.dns-helper as dns-helper
+import .net.names as names
 import .service as service
 
 /**
@@ -147,11 +148,8 @@ class Client:
   Validates $hostname and splits it into `[prefix, ".local"]`.
   */
   static parse_ hostname/string -> List:
-    if not dns-helper.has-local-suffix hostname:
-      throw "Invalid hostname: $hostname"
+    names.validate-hostname hostname
     prefix := hostname[..hostname.size - 6]
-    if prefix.is-empty or (prefix.starts-with ".") or (prefix.ends-with "."):
-      throw "Invalid hostname: $hostname"
     return [prefix, hostname[hostname.size - 6..]]
 
   /**
@@ -173,6 +171,9 @@ class Client:
       --txt/Map?=null
       --name/string?=null
       --hostname/string?=null:
+    names.validate-service-type type
+    if name: names.validate-instance-name name
+    names.validate-txt txt
     service_.register type port --txt=txt --name=name --hostname=hostname
 
   /**

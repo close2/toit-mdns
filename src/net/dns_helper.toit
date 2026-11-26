@@ -31,6 +31,10 @@ MAX-POINTER-HOPS_ ::= 16
 MAX-QUESTIONS_ ::= 64
 /// Upper bound on resource records per packet on constrained ESP32 heaps.
 MAX-RECORDS_ ::= 128
+/// Default multicast mDNS UDP payload limit (1500 MTU minus IP/UDP overhead with margin).
+MAX-MDNS-PACKET-SIZE ::= 1440
+/// Hard RFC 6762 §17 packet limit including IP and UDP headers.
+HARD-MAX-MDNS-PACKET-SIZE_ ::= 9000
 
 /**
 Restricted-form mDNS NSEC resource record (RFC 6762 §6.1).
@@ -317,6 +321,121 @@ encode-mdns-packet queries/List records/List -> ByteArray
     write-resource_ record --locations=locations --buffer=result
 
   return result.bytes
+
+/**
+Serializes an mDNS message into one or more wire packets, each at most
+$max-size octets (RFC 6762 §17).
+
+Packs $queries, $records, and $authorities in order, splitting across
+additional packets on overflow. For outgoing queries with Known-Answers,
+sets the `TC` bit on every non-final packet per RFC 6762 §7.2. Optional
+$additionals are added opportunistically to the final packet and dropped if
+they do not fit. Throws `"DNS_RECORD_EXCEEDS_MAX_PACKET_SIZE"` if a single
+question or record exceeds $max-size on its own.
+*/
+encode-mdns-packets queries/List records/List -> List
+    --id/int=0
+    --is-response/bool
+    --is-authoritative/bool=false
+    --authorities/List=[]
+    --additionals/List=[]
+    --max-size/int=MAX-MDNS-PACKET-SIZE:
+  effective-max := min max-size HARD-MAX-MDNS-PACKET-SIZE_
+  status-bits := is-response ? 0x8000 : 0x0000
+  if is-authoritative: status-bits |= 0x0400
+
+  packets := []
+  builder := PacketBuilder_ id status-bits effective-max
+
+  queries.do: | q/dns.Question |
+    if not builder.try-add-question q:
+      if builder.is-empty: throw "DNS_RECORD_EXCEEDS_MAX_PACKET_SIZE"
+      packets.add (builder.build --no-truncated)
+      builder = PacketBuilder_ id status-bits effective-max
+      if not builder.try-add-question q:
+        throw "DNS_RECORD_EXCEEDS_MAX_PACKET_SIZE"
+
+  records.do: | r/dns.Resource |
+    if not builder.try-add-record r 1:
+      if builder.is-empty: throw "DNS_RECORD_EXCEEDS_MAX_PACKET_SIZE"
+      // RFC 6762 §7.2: Set TC on non-final query packets carrying Known-Answers.
+      is-ka-split := not is-response and authorities.is-empty
+      packets.add (builder.build --truncated=is-ka-split)
+      builder = PacketBuilder_ id status-bits effective-max
+      if not builder.try-add-record r 1:
+        throw "DNS_RECORD_EXCEEDS_MAX_PACKET_SIZE"
+
+  authorities.do: | r/dns.Resource |
+    if not builder.try-add-record r 2:
+      if builder.is-empty: throw "DNS_RECORD_EXCEEDS_MAX_PACKET_SIZE"
+      packets.add (builder.build --no-truncated)
+      builder = PacketBuilder_ id status-bits effective-max
+      if not builder.try-add-record r 2:
+        throw "DNS_RECORD_EXCEEDS_MAX_PACKET_SIZE"
+
+  // Additionals are opportunistic: keep what fits in the last packet and drop the rest.
+  additionals.do: | r/dns.Resource |
+    builder.try-add-record r 3
+
+  if not builder.is-empty or packets.is-empty:
+    packets.add (builder.build --no-truncated)
+
+  return packets
+
+class PacketBuilder_:
+  id_/int
+  status-bits_/int
+  max-size_/int
+  buffer_/io.Buffer := io.Buffer
+  locations_/Map := {:}
+  qd-count_/int := 0
+  an-count_/int := 0
+  ns-count_/int := 0
+  ar-count_/int := 0
+
+  constructor .id_ .status-bits_ .max-size_:
+    12.repeat: buffer_.write-byte 0
+
+  is-empty -> bool:
+    return qd-count_ == 0 and an-count_ == 0 and ns-count_ == 0 and ar-count_ == 0
+
+  try-add-question q/dns.Question -> bool:
+    saved-size := buffer_.size
+    write-name_ q.name --locations=locations_ --buffer=buffer_
+    be := buffer_.big-endian
+    be.write-int16 q.type
+    be.write-int16 (dns.CLASS-INTERNET | (q.unicast-ok ? 0x8000 : 0))
+    if buffer_.size > max-size_:
+      rollback_ saved-size
+      return false
+    qd-count_++
+    return true
+
+  try-add-record rec/dns.Resource section/int -> bool:
+    saved-size := buffer_.size
+    write-resource_ rec --locations=locations_ --buffer=buffer_
+    if buffer_.size > max-size_:
+      rollback_ saved-size
+      return false
+    if section == 1: an-count_++
+    else if section == 2: ns-count_++
+    else: ar-count_++
+    return true
+
+  rollback_ saved-size/int -> none:
+    buffer_.resize saved-size
+    locations_.filter --in-place: | _ loc/int | loc < saved-size
+
+  build --truncated/bool=false -> ByteArray:
+    bytes := buffer_.bytes
+    bits := truncated ? (status-bits_ | 0x0200) : status-bits_
+    io.BIG-ENDIAN.put-uint16 bytes 0 id_
+    io.BIG-ENDIAN.put-uint16 bytes 2 bits
+    io.BIG-ENDIAN.put-uint16 bytes 4 qd-count_
+    io.BIG-ENDIAN.put-uint16 bytes 6 an-count_
+    io.BIG-ENDIAN.put-uint16 bytes 8 ns-count_
+    io.BIG-ENDIAN.put-uint16 bytes 10 ar-count_
+    return bytes
 
 write-resource_ record/dns.Resource --locations/Map? --buffer/io.Buffer -> none:
   write-name_ record.name --locations=locations --buffer=buffer
