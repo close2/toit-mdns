@@ -179,11 +179,12 @@ test-goodbye-evicts-flushed-cache-entry:
 
   // Peer departs with TTL=0 and flush=false.
   cache.add (dns.AResource "departing.local" 0 ip)
-  // Still visible during the 1s RFC 6762 §10.1 grace window:
-  expect-equals 1 (cache.lookup "departing.local" dns.RECORD-A).size
+  // Normal lookup must not return goodbye; entry remains in cache for the 1s grace window.
+  expect (cache.lookup "departing.local" dns.RECORD-A).is-empty
+  expect-equals 1 (cache.lookup "departing.local" dns.RECORD-A --include-goodbye).size
 
   sleep (Duration --ms=1100)
-  expect (cache.lookup "departing.local" dns.RECORD-A).is-empty
+  expect (cache.lookup "departing.local" dns.RECORD-A --include-goodbye).is-empty
   print "  PASS"
 
 test-conflict-manager-63-octet-and-case:

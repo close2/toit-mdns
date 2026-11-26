@@ -58,6 +58,7 @@ class StateManager:
   hostname_/string := ?
   expected-port_/int
   local-prefix-length_/int?
+  on-rename_/Lambda?
 
   probe-count_/int := 0
   probe-timer_/Task? := null
@@ -93,11 +94,13 @@ class StateManager:
   */
   constructor .socket_ .conflict-manager_ hostname/string .local-ip_
       --expected-port/int=5353
-      --local-prefix-length/int?=null:
+      --local-prefix-length/int?=null
+      --on-rename/Lambda?=null:
     assert: names.validate-hostname hostname
     hostname_ = hostname
     expected-port_ = expected-port
     local-prefix-length_ = local-prefix-length
+    on-rename_ = on-rename
     rebuild-host-records_
 
   rebuild-host-records_ -> none:
@@ -360,7 +363,11 @@ class StateManager:
   handle-probing-conflict_ -> none:
     if probe-timer_: probe-timer_.cancel
     record-conflict_
-    hostname_ = conflict-manager_.resolve-probing-conflict hostname_
+    old-hostname := hostname_
+    candidate := conflict-manager_.resolve-probing-conflict hostname_
+    if on-rename_:
+      candidate = on-rename_.call old-hostname candidate
+    hostname_ = candidate
     rebuild-host-records_
     enter-probing_
 
@@ -847,7 +854,8 @@ class StateManager:
         raw := v as ByteArray
         if prefix.size + raw.size > 255:
           throw "INVALID_TXT: entry for '$key-str' exceeds 255 octets"
-        list.add (prefix + raw)
+        combined := prefix + raw
+        list.add (combined.is-valid-string-content ? combined.to-string : combined)
       else:
         entry := "$key-str=$v"
         if entry.size > 255:

@@ -626,6 +626,15 @@ has-local-suffix name/string -> bool:
   return name-ends-with_ name ".local"
 
 /**
+Returns true if $name is valid for multicast DNS lookup (`.local`,
+`.in-addr.arpa`, or `.ip6.arpa`, matched case-insensitively per RFC 6762 §4).
+*/
+is-mdns-lookup-name name/string -> bool:
+  return (has-local-suffix name) or
+      (name-ends-with_ name ".in-addr.arpa") or
+      (name-ends-with_ name ".ip6.arpa")
+
+/**
 Validates that a decoded packet conforms to mDNS header requirements
 (RFC 6762 §18.3 `OPCODE == 0` and §18.11 `RCODE == 0`).
 */

@@ -11,7 +11,7 @@ import net
 import net.modules.dns
 import system
 import mdns.api.mdns-service show MdnsService
-import mdns.client show Client
+import mdns.client show Client LocalMdnsClient
 import mdns.net.dns-helper as dns-helper
 import mdns.net.ip-scope as ip-scope
 import mdns.net.mdns-socket show MdnsSocket
@@ -25,9 +25,7 @@ import .e2e-param show TEST-PORT
 import .support.capture
 
 /** Case names whose fix has not landed yet, with the phase that fixes them. */
-KNOWN-FAILING ::= {
-  "f5-lookup-throws-dns-exception",      // P6.
-}
+KNOWN-FAILING ::= {}
 
 LOCAL-IP ::= net.IpAddress.parse "127.0.0.1"
 PEER-IP ::= net.IpAddress.parse "127.0.0.2"
@@ -60,6 +58,12 @@ main:
   check "f4-close-closes-network": test-close-closes-network it
   check "p5-ip-refresh-goodbye-and-reprobe": test-ip-refresh-goodbye-and-reprobe it
   check "f5-lookup-throws-dns-exception": test-lookup-throws-dns-exception it
+  check "f6a-constructor-cleans-up": test-constructor-cleans-up it
+  check "f6b-close-wakes-pending-lookup": test-close-wakes-pending-lookup it
+  check "f6c-rename-rekeys-managers": test-rename-rekeys-managers it
+  check "f6d-non-local-lookup-rejected": test-non-local-lookup-rejected it
+  check "f6f-goodbye-not-returned": test-goodbye-not-returned it
+  check "f6g-binary-txt-known-answer": test-binary-txt-known-answer it
 
   if not failures_.is-empty:
     print "FAILED: $failures_"
@@ -547,6 +551,97 @@ test-lookup-throws-dns-exception port/int:
     e := expect-throws:
       client.dns-lookup "missing-f5.local" --timeout=(Duration --ms=300)
     assert-true_ e is dns.DnsException --message="got $e"
+
+test-constructor-cleans-up port/int:
+  // LocalMdnsClient with invalid hostname must throw without leaking provider/socket.
+  expect-throws: LocalMdnsClient --hostname="invalid-host"
+  // Client with invalid hostname closes its owned RPC client if it opened one.
+  provider := MdnsServiceProvider --port=port
+  provider.install
+  try:
+    expect-throws: Client --hostname="no-local-suffix"
+    assert-true_ provider.managers_.is-empty
+  finally:
+    provider.close
+    provider.uninstall
+
+test-close-wakes-pending-lookup port/int:
+  provider := MdnsServiceProvider --port=port --local-ip=LOCAL-IP
+  started := Time.monotonic-us
+  done-ms := -1
+  task::
+    provider.lookup "never-answers.local" --accept-ipv4=true --accept-ipv6=false --timeout-us=20_000_000
+    done-ms = (Time.monotonic-us - started) / 1000
+  sleep --ms=100
+  provider.close
+  deadline := Time.monotonic-us + 1_000_000
+  while done-ms < 0 and Time.monotonic-us < deadline:
+    sleep --ms=20
+  assert-true_ (0 <= done-ms < 1000) --message="lookup did not wake promptly on close (done-ms=$done-ms)"
+
+test-rename-rekeys-managers port/int:
+  provider := MdnsServiceProvider --port=port --local-ip=LOCAL-IP
+  c1 := Client --hostname="rekey.local" --service=provider.connect-locally
+  try:
+    m/StateManager := provider.managers_["rekey.local"]
+    sleep --ms=350  // Ensure first probe sent.
+    conflict := dns-helper.encode-mdns-packet [] [
+      dns.AResource "rekey.local" 120 (net.IpAddress.parse "10.0.0.88") --flush,
+    ] --is-response
+    m.process-packet (dns-helper.parse conflict) --source=(net.SocketAddress PEER-IP port)
+    assert-equals_ "rekey-2.local" c1.hostname
+    assert-true_ (not (provider.managers_.contains "rekey.local"))
+    assert-true_ (provider.managers_.contains "rekey-2.local")
+
+    // A new client requesting "rekey-2.local" joins the existing manager.
+    c2 := Client --hostname="rekey-2.local" --service=provider.connect-locally
+    try:
+      assert-equals_ 1 provider.managers_.size
+    finally:
+      c2.close
+  finally:
+    c1.close
+    provider.close
+
+test-non-local-lookup-rejected port/int:
+  with-client port "scope-q.local": | client/Client _ |
+    e := expect-throws: client.dns-lookup "example.com" --timeout=(Duration --ms=200)
+    assert-true_ e is dns.DnsException
+    e2 := expect-throws: client.dns-lookup "example.com" --record-types={dns.RECORD-A} --timeout=(Duration --ms=200)
+    assert-true_ e2 is dns.DnsException
+    // Reverse lookup (.in-addr.arpa) is allowed per RFC 6762 §4 (times out with DnsException).
+    e3 := expect-throws: client.dns-lookup "1.0.0.127.in-addr.arpa" --timeout=(Duration --ms=150)
+    assert-true_ e3 is dns.DnsException
+    assert-true_ ((e3 as dns.DnsException).text.contains "No name record found")
+
+test-goodbye-not-returned port/int:
+  socket := MdnsSocket --network=net.open --port=port
+  cache := MdnsCache
+  engine := QueryEngine socket cache
+  try:
+    // Positive A record, followed by a TTL=0 goodbye.
+    cache.add (dns.AResource "bye-host.local" 120 (net.IpAddress.parse "10.0.0.42") --flush)
+    assert-equals_ 1 (engine.lookup "bye-host.local" --record-types=dns.RECORD-A --timeout-us=200_000).size
+    cache.add (dns.AResource "bye-host.local" 0 (net.IpAddress.parse "10.0.0.42"))
+    res := engine.lookup "bye-host.local" --record-types=dns.RECORD-A --timeout-us=200_000
+    assert-true_ res.is-empty --message="goodbye record was returned as positive answer: $res"
+  finally:
+    engine.close
+    socket.close
+
+test-binary-txt-known-answer port/int:
+  socket := MdnsSocket --network=net.open --port=port
+  sm := StateManager socket ConflictManager "txt-ka.local" LOCAL-IP --expected-port=port
+  try:
+    // Valid UTF-8 ByteArray value in TXT map should normalize to string just like wire decode.
+    entries := sm.build-txt-list_ {"k": #[0x41, 0x42]}
+    our-rec := dns.TxtResource "svc._http._tcp.local" 4500 true entries
+    wire := dns-helper.encode-mdns-packet [dns.Question "svc._http._tcp.local" dns.RECORD-TXT] [our-rec] --is-response=false
+    decoded := dns-helper.parse wire
+    assert-true_ (dns-helper.has-known-answer decoded "svc._http._tcp.local" dns.RECORD-TXT 4500 --record=our-rec)
+  finally:
+    sm.stop
+    socket.close
 
 // --- Non-exiting assertions (the `expect` library exits the process). ---
 

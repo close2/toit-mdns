@@ -272,11 +272,53 @@ class MdnsServiceProvider extends services.ServiceProvider
 
     if not managers_.contains key:
       cm := ConflictManager
-      manager := StateManager socket_ cm name resolved-local-ip_
+      manager/StateManager? := null
+      on-rename := :: | old-name/string new-name/string |
+        handle-manager-rename_ manager cm old-name new-name
+      manager = StateManager socket_ cm name resolved-local-ip_
           --expected-port=port
           --local-prefix-length=local-prefix-length
+          --on-rename=on-rename
       managers_[key] = manager
       manager.start
+
+  handle-manager-rename_
+      manager/StateManager
+      cm/ConflictManager
+      old-name/string
+      new-name/string -> string:
+    old-key := old-name.to-ascii-lower
+    candidate := new-name
+    new-key := candidate.to-ascii-lower
+    while new-key != old-key and (managers_.contains new-key):
+      candidate = cm.resolve-probing-conflict candidate
+      new-key = candidate.to-ascii-lower
+    if new-key != old-key:
+      if (managers_.get old-key) == manager:
+        managers_.remove old-key
+        managers_[new-key] = manager
+      refs := manager-refs_.get old-key
+      if refs != null:
+        manager-refs_.remove old-key
+        manager-refs_[new-key] = refs
+      client-commitments_.do: | cid committed |
+        if committed == old-key:
+          client-commitments_[cid] = new-key
+      old-prefix := "$old-key|"
+      new-prefix := "$new-key|"
+      client-services_.do: | cid owned/Map |
+        if (client-commitments_.get cid) == new-key:
+          rekeyed := {:}
+          owned.do: | old-skey entry/RegisteredEntry_ |
+            new-skey := (old-skey.starts-with old-prefix)
+                ? "$new-prefix$(old-skey[old-prefix.size..])"
+                : old-skey
+            if new-skey != old-skey:
+              service-owners_.remove old-skey
+              service-owners_[new-skey] = cid
+            rekeyed[new-skey] = RegisteredEntry_ new-skey entry.type entry.instance-name entry.is-default
+          client-services_[cid] = rekeyed
+    return candidate
 
   decrement-ref_ key/string -> none:
     curr := manager-refs_.get key
@@ -444,6 +486,8 @@ class MdnsServiceProvider extends services.ServiceProvider
     closed_ = true
     managers_.do: | _ manager/StateManager |
       manager.stop
+    if query-engine_:
+      query-engine_.close
     if ip-refresh-task_:
       ip-refresh-task_.cancel
       ip-refresh-task_ = null
@@ -458,6 +502,8 @@ class MdnsServiceProvider extends services.ServiceProvider
       --accept-ipv4/bool
       --accept-ipv6/bool
       --timeout-us/int:
+    if not dns.is-mdns-lookup-name name:
+      throw "INVALID_ARGUMENT: not a .local name: $name"
     ensure-socket_
     mask := 0
     if accept-ipv4: mask |= dns.RECORD-A
@@ -471,6 +517,8 @@ class MdnsServiceProvider extends services.ServiceProvider
   lookup name/string -> List
       --record-types/int
       --timeout-us/int:
+    if not dns.is-mdns-lookup-name name:
+      throw "INVALID_ARGUMENT: not a .local name: $name"
     ensure-socket_
     return query-engine_.lookup name --record-types=record-types --timeout-us=timeout-us
 

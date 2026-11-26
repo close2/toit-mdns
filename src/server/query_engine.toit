@@ -35,12 +35,22 @@ class QueryEngine:
   cache_/MdnsCache
   pending_/Map := {:}          // lowercased name -> List<PendingQuery_>
   last-query-sent_/Map := {:}  // "name:mask" -> monotonic-us
+  closed_/bool := false
 
   constructor .socket_ .cache_:
 
   /** Replaces the underlying multicast socket after a network reset. */
   update-socket socket/MdnsSocket -> none:
     socket_ = socket
+
+  /** Closes the query engine and wakes all pending lookups immediately. */
+  close -> none:
+    if closed_: return
+    closed_ = true
+    pending_.do: | _ listeners/List |
+      listeners.do: | query/PendingQuery_ |
+        if not query.latch.has-value:
+          query.latch.set []
 
   /** Returns true if one or more lookups are currently awaiting responses. */
   has-pending -> bool:
@@ -50,7 +60,7 @@ class QueryEngine:
       --record-types/int
       --timeout-us/int:
     name = name.to-ascii-lower
-    if record-types == 0 or timeout-us <= 0: return []
+    if closed_ or record-types == 0 or timeout-us <= 0: return []
 
     is-ptr-browse := record-types == dns.RECORD-PTR
 
@@ -86,14 +96,16 @@ class QueryEngine:
         catch --unwind=(: it != "DEADLINE_EXCEEDED"):
           with-timeout (Duration --us=wait-us):
             first := query.latch.get
+            if closed_: return []
             if is-ptr-browse:
               // Brief aggregation window so additional LAN responders can answer.
               extra-us := min BROWSE-AGGREGATION-US_ (deadline - Time.monotonic-us)
               if extra-us > 0:
                 sleep (Duration --us=extra-us)
-              return search-cache_ name record-types
+              return closed_ ? [] : (search-cache_ name record-types)
             return first
           timed-out = false
+        if closed_: return []
         if not query.latch.has-value:
           timed-out = true
         if not timed-out and query.latch.has-value:
