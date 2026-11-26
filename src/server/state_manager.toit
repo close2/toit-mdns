@@ -18,8 +18,9 @@ class DeferredRecord_:
   record/dns.Resource
   rate-key/string
   due-us/int
+  additionals/List
 
-  constructor .record .rate-key .due-us:
+  constructor .record .rate-key .due-us .additionals=[]:
 
 /**
 mDNS state machine managing hostname claims, service announcements,
@@ -293,8 +294,22 @@ class StateManager:
 
     if state_ != STATE-ANNOUNCING and state_ != STATE-ESTABLISHED: return
 
+    if decoded.is-response and not deferred-multicast_.is-empty:
+      suppress-duplicate-deferred_ decoded
+
     if not decoded.is-response and (has-relevant-question_ decoded):
       send-response_ decoded --source=source
+
+  suppress-duplicate-deferred_ decoded/dns.DecodedPacket -> none:
+    check := : | res/dns.Resource |
+      if res.type == dns.RECORD-PTR:
+        key := record-rate-key_ res
+        pending/DeferredRecord_? := deferred-multicast_.get key
+        if pending and res.ttl >= pending.record.ttl and
+            (dns.resource-rdata-matches_ res pending.record):
+          deferred-multicast_.remove key
+    decoded.resources.do check
+    decoded.additionals.do check
 
   defer-probing-one-second_ -> none:
     record-conflict_
@@ -547,7 +562,13 @@ class StateManager:
         use-unicast := legacy-query or
             (not is-probe-query and source != null and q-host.unicast-ok and
                 (was-multicast-within-quarter-ttl_ host-answer 120 now))
-        add-unique-record_ (use-unicast ? unicast-answers : multicast-answers) host-answer
+        ans-target := use-unicast ? unicast-answers : multicast-answers
+        add-target := use-unicast ? unicast-additionals : multicast-additionals
+        add-unique-record_ ans-target host-answer
+        // RFC 6762 §6.1: Include restricted-form NSEC as additional on positive A answers.
+        nsec-ttl := legacy-query ? 10 : 120
+        add-unique-record_ add-target
+            (dns.NsecResource hostname_ nsec-ttl (not legacy-query) hostname_ [dns.RECORD-A])
     else if not query:
       add-unique-record_ multicast-answers host-a-120_
 
@@ -656,10 +677,14 @@ class StateManager:
         not (multicast-answers.any (: dns.resource-equals it r))
       // RFC 6762 §6: Probe defenses are permitted at 250ms intervals;
       // normal multicast responses are limited to 1s intervals.
+      // Shared-record (PTR) answers SHOULD be delayed 20-120ms.
       min-interval := is-probe-query ? PROBE-DEFENSE-RATE-LIMIT-US_ : MULTICAST-RATE-LIMIT-WINDOW-US_
+      has-shared := multicast-answers.any: | r/dns.Resource | r.type == dns.RECORD-PTR
+      delay-us := (not is-probe-query and has-shared) ? (20_000 + (random 101) * 1_000) : 0
       enqueue-or-send-multicast_ multicast-answers now
           --additionals=filtered-mcast-add
           --min-interval-us=min-interval
+          --delay-us=delay-us
 
   add-unique-record_ list/List record/dns.Resource -> none:
     if list.any (: dns.resource-equals it record): return
@@ -684,22 +709,32 @@ class StateManager:
     entry[1] = count + 1
     return true
 
-  enqueue-or-send-multicast_ records/List now/int --additionals/List=[] --min-interval-us/int -> none:
+  enqueue-or-send-multicast_ records/List now/int
+      --additionals/List=[]
+      --min-interval-us/int
+      --delay-us/int=0 -> none:
     ready := []
+    attached-adds := false
     records.do: | rec/dns.Resource |
       key := record-rate-key_ rec
       last := last-multicast-times_.get key
-      if not last or (now - last) >= min-interval-us:
+      rate-due := last ? (last + min-interval-us) : now
+      target-due := max rate-due (now + delay-us)
+      if target-due <= now:
         ready.add rec
         last-multicast-times_[key] = now
       else:
-        due-us := last + min-interval-us
         existing/DeferredRecord_? := deferred-multicast_.get key
         if existing:
-          effective-due := min existing.due-us due-us
-          deferred-multicast_[key] = DeferredRecord_ rec key effective-due
+          effective-due := min existing.due-us target-due
+          merged-adds := (not attached-adds and existing.additionals.is-empty) ? additionals : existing.additionals
+          if not attached-adds and existing.additionals.is-empty and not additionals.is-empty:
+            attached-adds = true
+          deferred-multicast_[key] = DeferredRecord_ rec key effective-due merged-adds
         else if deferred-multicast_.size < MAX-DEFERRED-RECORDS_:
-          deferred-multicast_[key] = DeferredRecord_ rec key due-us
+          batch-adds := (not attached-adds and not additionals.is-empty) ? additionals : []
+          if not batch-adds.is-empty: attached-adds = true
+          deferred-multicast_[key] = DeferredRecord_ rec key target-due batch-adds
 
     ready-additionals := []
     if not ready.is-empty:
@@ -754,6 +789,7 @@ class StateManager:
 
           send-now := Time.monotonic-us
           due-records := []
+          candidate-additionals := []
           sent-keys := []
           // Coalesce any record due within 5ms into a single UDP packet.
           deferred-multicast_.do: | key item/DeferredRecord_ |
@@ -761,10 +797,26 @@ class StateManager:
               due-records.add item.record
               last-multicast-times_[key] = send-now
               sent-keys.add key
+              item.additionals.do: | add-rec/dns.Resource |
+                add-unique-record_ candidate-additionals add-rec
           sent-keys.do: deferred-multicast_.remove it
 
+          due-additionals := []
+          candidate-additionals.do: | add-rec/dns.Resource |
+            if not (due-records.any (: dns.resource-equals it add-rec)):
+              add-key := record-rate-key_ add-rec
+              last := last-multicast-times_.get add-key
+              if not last or (send-now - last) >= MULTICAST-RATE-LIMIT-WINDOW-US_:
+                due-additionals.add add-rec
+                last-multicast-times_[add-key] = send-now
+
           if not due-records.is-empty and not socket_.is-closed:
-            send-raw_ --queries=[] --records=due-records --is-response --is-authoritative
+            send-raw_
+                --queries=[]
+                --records=due-records
+                --additionals=due-additionals
+                --is-response
+                --is-authoritative
       finally:
         if deferred-send-task_ == Task.current:
           deferred-send-task_ = null
